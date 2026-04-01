@@ -2,10 +2,6 @@
 
 中文 | [English](#english)
 
-MicMail 已从原来的本地 `Express + index.html` 邮件查看器，重构为可部署在 **Cloudflare Workers** 上的归档系统。
-
-它现在包含：
-
 - Worker 托管的管理后台
 - D1 保存会话、邮箱账号、邮件元数据和正文
 - R2 保存附件二进制文件
