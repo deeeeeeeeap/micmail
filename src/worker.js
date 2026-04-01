@@ -1,6 +1,4 @@
 import { APP_HTML } from "./ui.js";
-import { SCHEMA_SQL } from "./schema.js";
-
 const SESSION_COOKIE = "mail_admin_session";
 const DEFAULT_SESSION_TTL_HOURS = 12;
 const DEFAULT_RETENTION_DAYS = 90;
@@ -1054,17 +1052,41 @@ async function ensureSchema(env) {
   }
 
   if (!schemaPromise) {
-    schemaPromise = env.DB.exec(SCHEMA_SQL).catch((error) => {
+    schemaPromise = verifySchema(env).catch((error) => {
       schemaPromise = undefined;
-      const detail = error && error.message ? error.message : String(error);
-      throw new HttpError(
-        500,
-        "Database initialization failed. Check the D1 binding `DB` and run schema.sql. Detail: " +
-          detail,
-      );
+      throw error;
     });
   }
   return await schemaPromise;
+}
+
+async function verifySchema(env) {
+  const result = await env.DB.prepare(
+    `SELECT name
+     FROM sqlite_schema
+     WHERE type = 'table'
+       AND name IN ('admin_sessions', 'mail_accounts', 'messages', 'attachments', 'sync_runs')
+     ORDER BY name`,
+  ).all();
+
+  const tableNames = new Set((result.results ?? []).map((row) => row.name));
+  const requiredTables = [
+    "admin_sessions",
+    "mail_accounts",
+    "messages",
+    "attachments",
+    "sync_runs",
+  ];
+  const missing = requiredTables.filter((name) => !tableNames.has(name));
+
+  if (missing.length) {
+    throw new HttpError(
+      500,
+      "Database schema is incomplete. Missing tables: " +
+        missing.join(", ") +
+        ". Execute schema.sql in D1.",
+    );
+  }
 }
 
 function jsonResponse(payload, status = 200, extraHeaders = {}) {
