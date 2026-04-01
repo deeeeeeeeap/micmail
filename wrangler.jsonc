@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-mail-archive-worker",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-04-01",
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+  "vars": {
+    "MAIL_RETENTION_DAYS": "90",
+    "SESSION_TTL_HOURS": "12",
+    "SYNC_PAGE_SIZE": "50",
+    "MAX_SYNC_PAGES": "40",
+    "SYNC_FOLDERS": "inbox,junkemail"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloud-mail-archive-db",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ATTACHMENTS",
+      "bucket_name": "cloud-mail-archive-attachments"
+    }
+  ]
+}

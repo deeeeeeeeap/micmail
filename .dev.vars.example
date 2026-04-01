@@ -1,0 +1,4 @@
+ADMIN_PASSWORD=change-this-password
+SESSION_SECRET=replace-with-long-random-session-secret
+TOKEN_ENCRYPTION_SECRET=replace-with-long-random-encryption-secret
+MICROSOFT_TENANT_ID=common

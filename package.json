@@ -1,0 +1,23 @@
+{
+  "name": "cloudflare-mail-archive-worker",
+  "version": "2.0.0",
+  "description": "Cloudflare Worker mail archive for Microsoft Graph with D1, R2, admin auth, and scheduled sync.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "d1",
+    "r2",
+    "microsoft-graph",
+    "mail-archive"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "wrangler": "^4.79.0"
+  }
+}
