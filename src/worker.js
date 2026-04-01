@@ -232,7 +232,15 @@ async function createAccountRoute(request, env) {
   const refreshToken = requireString(body.refreshToken, "refreshToken");
   const emailInput = typeof body.email === "string" ? body.email.trim() : "";
 
-  const { accessToken, profile } = await verifyMicrosoftAccount(env, clientId, refreshToken);
+  let accessToken;
+  let profile;
+  try {
+    const verified = await verifyMicrosoftAccount(env, clientId, refreshToken);
+    accessToken = verified.accessToken;
+    profile = verified.profile;
+  } catch (error) {
+    throw new HttpError(400, "Microsoft account validation failed: " + summarizeUpstreamError(error));
+  }
   const email = emailInput || profile.mail || profile.userPrincipalName;
 
   if (!email) {
@@ -286,7 +294,11 @@ async function updateAccountRoute(request, env, accountId) {
   if (body.clientId || body.refreshToken) {
     clientId = requireString(body.clientId ?? existing.client_id, "clientId");
     const refreshToken = requireString(body.refreshToken, "refreshToken");
-    await verifyMicrosoftAccount(env, clientId, refreshToken);
+    try {
+      await verifyMicrosoftAccount(env, clientId, refreshToken);
+    } catch (error) {
+      throw new HttpError(400, "Microsoft account validation failed: " + summarizeUpstreamError(error));
+    }
     encryptedRefreshToken = await encryptText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
   }
 
@@ -1309,6 +1321,11 @@ function maskToken(token) {
     return "***";
   }
   return token.slice(0, 6) + "..." + token.slice(-4);
+}
+
+function summarizeUpstreamError(error) {
+  const message = error && error.message ? String(error.message) : String(error);
+  return message.replace(/\s+/g, " ").trim().slice(0, 600);
 }
 
 function logInfo(event, detail) {
