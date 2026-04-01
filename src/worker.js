@@ -15,7 +15,6 @@ const aesKeyCache = new Map();
 export default {
   async fetch(request, env, ctx) {
     try {
-      await ensureSchema(env);
       return await handleRequest(request, env, ctx);
     } catch (error) {
       return handleError(error);
@@ -39,10 +38,6 @@ async function handleRequest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  if (request.method === "OPTIONS") {
-    return new Response(null, { headers: corsHeaders() });
-  }
-
   if (path === "/" || path === "/index.html") {
     return new Response(APP_HTML, {
       headers: {
@@ -52,9 +47,15 @@ async function handleRequest(request, env) {
     });
   }
 
+  if (request.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders() });
+  }
+
   if (path === "/favicon.ico") {
     return new Response(null, { status: 204 });
   }
+
+  await ensureSchema(env);
 
   if (path === "/api/health" && request.method === "GET") {
     return jsonResponse({
@@ -1048,8 +1049,20 @@ async function readJson(request) {
 }
 
 async function ensureSchema(env) {
+  if (!env.DB) {
+    throw new HttpError(500, "D1 binding `DB` is not configured.");
+  }
+
   if (!schemaPromise) {
-    schemaPromise = env.DB.exec(SCHEMA_SQL);
+    schemaPromise = env.DB.exec(SCHEMA_SQL).catch((error) => {
+      schemaPromise = undefined;
+      const detail = error && error.message ? error.message : String(error);
+      throw new HttpError(
+        500,
+        "Database initialization failed. Check the D1 binding `DB` and run schema.sql. Detail: " +
+          detail,
+      );
+    });
   }
   return await schemaPromise;
 }
@@ -1071,6 +1084,8 @@ function handleError(error) {
   const message = error instanceof HttpError ? error.message : "Internal server error.";
   if (!(error instanceof HttpError)) {
     console.error(error);
+  } else {
+    console.error("http_error", status, message);
   }
   return jsonResponse({ success: false, error: message }, status);
 }
