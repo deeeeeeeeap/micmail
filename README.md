@@ -169,6 +169,8 @@ It now includes:
   - `SESSION_SECRET`
   - `TOKEN_ENCRYPTION_SECRET`
 
+Use Cloudflare Dashboard `Secrets`, not plain text `Variables`, for these three values.
+
 Optional:
 
 - `MICROSOFT_TENANT_ID`

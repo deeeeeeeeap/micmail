@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "cloudflare-mail-archive-worker",
+  "name": "micmail",
   "main": "src/worker.js",
   "compatibility_date": "2026-04-01",
   "triggers": {
@@ -16,14 +16,14 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "cloud-mail-archive-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_name": "micmail",
+      "database_id": "eeb9e204-432e-4394-b9a6-0a5efc521bc0"
     }
   ],
   "r2_buckets": [
     {
       "binding": "ATTACHMENTS",
-      "bucket_name": "cloud-mail-archive-attachments"
+      "bucket_name": "micmail"
     }
   ]
 }
