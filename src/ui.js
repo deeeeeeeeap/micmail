@@ -579,6 +579,95 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         }
       }
 
+      function parseBulkAccounts(input) {
+        const lines = String(input || "")
+          .split(/\r?\n/)
+          .map(function (line) { return line.trim(); })
+          .filter(Boolean);
+
+        return lines.map(function (line, index) {
+          const parts = line.split("----");
+          if (parts.length < 4) {
+            throw new Error("第 " + (index + 1) + " 行格式错误，必须是 邮箱----密码----ClientID----RefreshToken");
+          }
+
+          const email = (parts[0] || "").trim();
+          const clientId = (parts[2] || "").trim();
+          const refreshToken = parts.slice(3).join("----").trim();
+
+          if (!email || !clientId || !refreshToken) {
+            throw new Error("第 " + (index + 1) + " 行缺少邮箱、ClientID 或 RefreshToken");
+          }
+
+          return {
+            email: email,
+            clientId: clientId,
+            refreshToken: refreshToken
+          };
+        });
+      }
+
+      async function handleBulkImport(event) {
+        event.preventDefault();
+        const raw = document.getElementById("bulk-account-input").value.trim();
+        if (!raw) {
+          setNotice("请先粘贴批量账号文本。", "error");
+          return;
+        }
+
+        let accounts;
+        try {
+          accounts = parseBulkAccounts(raw);
+        } catch (error) {
+          setNotice(error.message, "error");
+          return;
+        }
+
+        let successCount = 0;
+        const failures = [];
+        setNotice("正在批量导入 " + accounts.length + " 个账号，请稍候...");
+
+        for (const account of accounts) {
+          try {
+            await api("/api/accounts", {
+              method: "POST",
+              body: JSON.stringify(account)
+            });
+            successCount += 1;
+          } catch (error) {
+            failures.push(account.email + ": " + error.message);
+          }
+        }
+
+        await refreshDashboard();
+        document.getElementById("bulk-account-input").value = "";
+        document.getElementById("bulk-account-file").value = "";
+
+        if (failures.length) {
+          setNotice(
+            "批量导入完成，成功 " + successCount + " 个，失败 " + failures.length + " 个。首个错误: " + failures[0],
+            "error"
+          );
+          return;
+        }
+
+        setNotice("批量导入完成，共成功导入 " + successCount + " 个账号。");
+      }
+
+      function handleBulkFileSelect(event) {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = function () {
+          document.getElementById("bulk-account-input").value = String(reader.result || "");
+        };
+        reader.onerror = function () {
+          setNotice("读取批量导入文件失败。", "error");
+        };
+        reader.readAsText(file, "UTF-8");
+      }
+
       async function handleSyncAll() {
         try {
           setNotice("正在执行全量同步，耗时取决于邮箱和附件数量...");
@@ -780,6 +869,13 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '          <label>Refresh Token<textarea id="account-refresh-token" required placeholder="粘贴 refresh token"></textarea></label>'
           + '          <button class="btn primary" type="submit">保存账号</button>'
           + '        </form>'
+          + '        <form id="bulk-account-form" class="stack card" style="padding:14px">'
+          + '          <div class="message-top"><div class="message-subject">批量导入</div><div class="muted">格式: 邮箱----密码----ClientID----RefreshToken</div></div>'
+          + '          <label>选择 TXT 文件<input id="bulk-account-file" type="file" accept=".txt,.csv,text/plain" /></label>'
+          + '          <label>批量文本<textarea id="bulk-account-input" placeholder="每行一个账号，示例：&#10;user@example.com----password----client-id----refresh-token"></textarea></label>'
+          + '          <div class="muted">第二段密码会被忽略，仅使用邮箱、ClientID 和 RefreshToken。</div>'
+          + '          <button class="btn primary" type="submit">批量导入账号</button>'
+          + '        </form>'
           + '        <div class="account-list">' + (accountItems || '<div class="empty">还没有已保存的邮箱账号。</div>') + '</div>'
           + '      </div>'
           + '    </div>'
@@ -824,6 +920,12 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
         const accountForm = document.getElementById("account-form");
         if (accountForm) accountForm.onsubmit = handleAddAccount;
+
+        const bulkAccountForm = document.getElementById("bulk-account-form");
+        if (bulkAccountForm) bulkAccountForm.onsubmit = handleBulkImport;
+
+        const bulkAccountFile = document.getElementById("bulk-account-file");
+        if (bulkAccountFile) bulkAccountFile.onchange = handleBulkFileSelect;
 
         const filterForm = document.getElementById("filter-form");
         if (filterForm) filterForm.onsubmit = handleFilter;
