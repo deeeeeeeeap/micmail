@@ -6,17 +6,19 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
     <title>Cloud Mail Archive</title>
     <style>
       :root {
-        --bg: #f3efe7;
-        --paper: #fffaf3;
-        --ink: #14213d;
-        --muted: #5c667a;
-        --line: #e4dac8;
-        --brand: #0d6e6e;
-        --brand-strong: #084c4c;
-        --accent: #c76d3a;
+        --bg: #f6f1e8;
+        --paper: #fffdf8;
+        --paper-soft: #fbf6ee;
+        --ink: #13213b;
+        --muted: #6d7890;
+        --line: #e7ddce;
+        --brand: #08736f;
+        --brand-strong: #05524f;
+        --brand-soft: #e3f3f0;
+        --accent: #c86f3d;
         --danger: #b42318;
         --success: #067647;
-        --shadow: 0 24px 60px rgba(20, 33, 61, 0.12);
+        --shadow: 0 26px 80px rgba(31, 43, 69, 0.14);
       }
 
       * {
@@ -25,10 +27,11 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       body {
         margin: 0;
-        font-family: "Segoe UI", "PingFang SC", sans-serif;
+        font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
         background:
-          radial-gradient(circle at top left, rgba(199, 109, 58, 0.18), transparent 28%),
-          linear-gradient(135deg, #efe4d2 0%, var(--bg) 50%, #e9f1ef 100%);
+          radial-gradient(circle at 10% 0%, rgba(199, 109, 58, 0.18), transparent 28%),
+          radial-gradient(circle at 92% 12%, rgba(8, 115, 111, 0.16), transparent 30%),
+          linear-gradient(135deg, #efe4d2 0%, var(--bg) 52%, #edf5f2 100%);
         color: var(--ink);
         min-height: 100vh;
       }
@@ -45,18 +48,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       .shell {
-        width: min(1440px, calc(100vw - 32px));
-        margin: 16px auto;
-        background: rgba(255, 250, 243, 0.9);
+        width: min(1760px, calc(100vw - 28px));
+        margin: 14px auto;
+        background: rgba(255, 253, 248, 0.94);
         backdrop-filter: blur(18px);
         border: 1px solid rgba(228, 218, 200, 0.8);
-        border-radius: 28px;
+        border-radius: 30px;
         box-shadow: var(--shadow);
         overflow: hidden;
       }
 
       .hero {
-        padding: 28px 32px 20px;
+        padding: 24px 30px 18px;
         border-bottom: 1px solid var(--line);
         display: flex;
         justify-content: space-between;
@@ -79,14 +82,15 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       .hero h1 {
-        font-size: 30px;
+        font-size: clamp(26px, 2.2vw, 40px);
         line-height: 1.1;
+        letter-spacing: -0.03em;
       }
 
       .hero p {
         margin-top: 8px;
         color: var(--muted);
-        max-width: 620px;
+        max-width: 720px;
       }
 
       .hero-actions,
@@ -100,14 +104,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       .app-grid {
         display: grid;
-        grid-template-columns: 320px 1.15fr 1fr;
+        grid-template-columns: minmax(380px, 0.9fr) minmax(500px, 1.25fr) minmax(520px, 1.2fr);
         min-height: 78vh;
+        max-height: calc(100vh - 190px);
       }
 
       .panel {
         min-width: 0;
         border-right: 1px solid var(--line);
-        background: rgba(255, 255, 255, 0.45);
+        background: rgba(255, 255, 255, 0.5);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
       }
 
       .panel:last-child {
@@ -115,13 +123,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       .panel-head {
-        padding: 20px 20px 14px;
+        padding: 22px 24px 16px;
         border-bottom: 1px solid var(--line);
+        background: rgba(255, 253, 248, 0.84);
+        position: sticky;
+        top: 0;
+        z-index: 1;
       }
 
       .panel-head h3 {
         margin: 0;
-        font-size: 15px;
+        font-size: 18px;
+        letter-spacing: -0.01em;
       }
 
       .panel-head p {
@@ -131,14 +144,22 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       .panel-body {
-        padding: 16px 20px 24px;
+        padding: 18px 24px 26px;
+        overflow: auto;
+        min-width: 0;
+        min-height: 0;
       }
 
       .card,
       .message-card {
         border: 1px solid var(--line);
-        border-radius: 18px;
-        background: rgba(255, 255, 255, 0.84);
+        border-radius: 22px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: 0 12px 36px rgba(31, 43, 69, 0.06);
+      }
+
+      form.card {
+        overflow: hidden;
       }
 
       .metric-grid {
@@ -181,11 +202,13 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       select,
       textarea {
         width: 100%;
+        min-width: 0;
         border: 1px solid #d8ccb7;
         background: white;
-        padding: 12px 14px;
-        border-radius: 14px;
+        padding: 12px 16px;
+        border-radius: 16px;
         outline: none;
+        color: var(--ink);
       }
 
       textarea {
@@ -206,6 +229,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         padding: 11px 16px;
         background: #dfe9e5;
         color: var(--ink);
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        max-width: 100%;
+        white-space: nowrap;
+        transition: transform 0.14s ease, box-shadow 0.14s ease, background 0.14s ease;
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 10px 24px rgba(8, 115, 111, 0.12);
       }
 
       .btn.primary {
@@ -228,6 +263,11 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         font-size: 13px;
       }
 
+      form .btn.primary {
+        width: 100%;
+        min-height: 48px;
+      }
+
       .account-list,
       .message-list,
       .attachment-list {
@@ -237,7 +277,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       .account-item,
       .message-item {
-        padding: 14px;
+        padding: 16px;
+        overflow: hidden;
       }
 
       .account-item.active,
@@ -260,6 +301,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       .account-email,
       .message-subject {
         font-weight: 700;
+        overflow-wrap: anywhere;
       }
 
       .status-pill {
@@ -271,6 +313,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         font-size: 12px;
         background: rgba(13, 110, 110, 0.09);
         color: var(--brand-strong);
+        max-width: 100%;
       }
 
       .status-pill.error {
@@ -284,10 +327,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       .detail-hint {
         color: var(--muted);
         font-size: 13px;
+        overflow-wrap: anywhere;
       }
 
       .message-item {
         cursor: pointer;
+        transition: border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+      }
+
+      .message-item:hover {
+        transform: translateY(-1px);
+        border-color: rgba(8, 115, 111, 0.28);
+        box-shadow: 0 16px 34px rgba(31, 43, 69, 0.08);
       }
 
       .message-item.unread .message-subject {
@@ -311,7 +362,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       .detail-frame {
         width: 100%;
-        min-height: 380px;
+        min-height: 460px;
+        max-height: 58vh;
         border: 1px solid var(--line);
         border-radius: 18px;
         background: white;
@@ -360,15 +412,52 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       @media (max-width: 1180px) {
         .app-grid {
           grid-template-columns: 1fr;
+          max-height: none;
         }
 
         .panel {
           border-right: none;
           border-bottom: 1px solid var(--line);
+          max-height: none;
         }
 
         .panel:last-child {
           border-bottom: none;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .shell {
+          width: calc(100vw - 12px);
+          margin: 6px auto;
+          border-radius: 20px;
+        }
+
+        .hero,
+        .panel-head,
+        .panel-body {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+
+        .hero {
+          flex-direction: column;
+        }
+
+        .hero-actions,
+        .toolbar,
+        .form-row,
+        .detail-actions {
+          width: 100%;
+        }
+
+        .hero-actions .btn,
+        .toolbar .btn {
+          flex: 1 1 140px;
+        }
+
+        .metric-grid {
+          grid-template-columns: 1fr;
         }
       }
     </style>
@@ -891,7 +980,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '    <div>'
           + '      <div class="eyebrow">Cloudflare Worker Archive</div>'
           + '      <h1>Microsoft 邮件归档后台</h1>'
-          + '      <p>账号写入 D1，附件写入 R2，定时任务用 Microsoft Graph 增量拉取邮件。删除归档不会删除源邮箱中的邮件。</p>'
+          + '      <p>账号写入 D1，附件写入 R2；优先 Graph，失败后自动使用 IMAP OAuth2 增量收信。删除归档不会删除源邮箱中的邮件。</p>'
           + '    </div>'
           + '    <div class="hero-actions">'
           + '      <button class="btn secondary" id="sync-all-btn">' + (state.syncingAll ? '正在启动同步...' : '一键后台同步全部') + '</button>'
@@ -908,7 +997,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '  </section>'
           + '  <section class="app-grid">'
           + '    <div class="panel">'
-          + '      <div class="panel-head"><h3>邮箱账号</h3><p>保存 Microsoft Graph 凭据并触发单账号同步。</p></div>'
+          + '      <div class="panel-head"><h3>邮箱账号</h3><p>保存 OAuth 凭据、设置分组，并触发单账号同步。</p></div>'
           + '      <div class="panel-body stack">'
           + '        <form id="account-form" class="stack card" style="padding:14px">'
           + '          <label>邮箱地址（可选）<input id="account-email" placeholder="如果留空，会尝试从 Graph 自动识别" /></label>'
