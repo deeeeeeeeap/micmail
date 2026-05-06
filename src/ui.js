@@ -386,7 +386,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         selectedMessage: null,
         detail: null,
         stats: { total: 0 },
-        filters: { accountId: "", folder: "", keyword: "" }
+        filters: { accountId: "", folder: "", group: "", keyword: "" },
+        syncingAll: false
       };
 
       async function api(path, options) {
@@ -454,6 +455,18 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         }) || null;
       }
 
+      function accountGroups() {
+        const seen = {};
+        return state.accounts
+          .map(function (account) { return account.group_name || "默认分组"; })
+          .filter(function (group) {
+            if (seen[group]) return false;
+            seen[group] = true;
+            return true;
+          })
+          .sort();
+      }
+
       async function bootstrap() {
         render();
         try {
@@ -484,6 +497,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const params = new URLSearchParams();
         if (state.filters.accountId) params.set("accountId", state.filters.accountId);
         if (state.filters.folder) params.set("folder", state.filters.folder);
+        if (state.filters.group) params.set("group", state.filters.group);
         if (state.filters.keyword) params.set("keyword", state.filters.keyword);
         params.set("page", "1");
         params.set("pageSize", "25");
@@ -559,6 +573,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const email = document.getElementById("account-email").value.trim();
         const clientId = document.getElementById("account-client-id").value.trim();
         const refreshToken = document.getElementById("account-refresh-token").value.trim();
+        const groupName = document.getElementById("account-group").value.trim();
 
         if (!clientId || !refreshToken) {
           setNotice("Client ID 和 Refresh Token 不能为空。", "error");
@@ -569,7 +584,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           setNotice("正在验证并保存邮箱账号...");
           await api("/api/accounts", {
             method: "POST",
-            body: JSON.stringify({ email: email, clientId: clientId, refreshToken: refreshToken })
+            body: JSON.stringify({ email: email, clientId: clientId, refreshToken: refreshToken, groupName: groupName })
           });
           document.getElementById("account-form").reset();
           await refreshDashboard();
@@ -593,7 +608,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
           const email = (parts[0] || "").trim();
           const clientId = (parts[2] || "").trim();
-          const refreshToken = parts.slice(3).join("----").trim();
+          const refreshToken = parts.length > 4 ? (parts[3] || "").trim() : parts.slice(3).join("----").trim();
+          const groupName = (parts[5] || parts[4] || "").trim();
 
           if (!email || !clientId || !refreshToken) {
             throw new Error("第 " + (index + 1) + " 行缺少邮箱、ClientID 或 RefreshToken");
@@ -602,7 +618,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           return {
             email: email,
             clientId: clientId,
-            refreshToken: refreshToken
+            refreshToken: refreshToken,
+            groupName: groupName
           };
         });
       }
@@ -669,13 +686,20 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       async function handleSyncAll() {
+        if (state.syncingAll) return;
+        state.syncingAll = true;
         try {
-          setNotice("正在执行全量同步，耗时取决于邮箱和附件数量...");
+          setNotice("已提交全部账号后台同步，页面不会再长时间卡住。稍后会自动刷新状态...");
           await api("/api/sync/run", { method: "POST", body: "{}" });
-          await refreshDashboard();
-          setNotice("全量同步已完成。");
+          render();
+          setTimeout(refreshDashboard, 3000);
+          setTimeout(refreshDashboard, 10000);
+          setNotice("全部账号同步已在后台启动。");
         } catch (error) {
           setNotice(error.message, "error");
+        } finally {
+          state.syncingAll = false;
+          render();
         }
       }
 
@@ -737,8 +761,28 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         event.preventDefault();
         state.filters.accountId = document.getElementById("filter-account").value;
         state.filters.folder = document.getElementById("filter-folder").value;
+        state.filters.group = document.getElementById("filter-group").value;
         state.filters.keyword = document.getElementById("filter-keyword").value.trim();
         await loadMessages();
+      }
+
+      async function handleSetGroup(accountId) {
+        const account = state.accounts.find(function (item) {
+          return String(item.id) === String(accountId);
+        });
+        if (!account) return;
+        const groupName = prompt("请输入分组名称", account.group_name || "默认分组");
+        if (groupName === null) return;
+        try {
+          await api("/api/accounts/" + accountId, {
+            method: "PATCH",
+            body: JSON.stringify({ groupName: groupName.trim() || "默认分组" })
+          });
+          await refreshDashboard();
+          setNotice("分组已更新。");
+        } catch (error) {
+          setNotice(error.message, "error");
+        }
       }
 
       function renderLogin() {
@@ -760,6 +804,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       }
 
       function renderDashboard() {
+        const groups = accountGroups();
         const accountItems = state.accounts.map(function (account) {
           const isActive = String(account.id) === String(state.filters.accountId);
           const statusClass = account.last_sync_status === "error" ? "status-pill error" : "status-pill";
@@ -769,6 +814,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '    <div>'
             + '      <div class="account-email">' + escapeHtml(account.email) + '</div>'
             + '      <div class="account-meta">Client ID: <span class="code">' + escapeHtml(shortText(account.client_id, 20)) + '</span></div>'
+            + '      <div class="account-meta">分组: <span class="status-pill">' + escapeHtml(account.group_name || "默认分组") + '</span></div>'
             + '    </div>'
             + '    <span class="' + statusClass + '">' + escapeHtml(account.last_sync_status || "idle") + '</span>'
             + '  </div>'
@@ -777,6 +823,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '  <div class="toolbar" style="margin-top:12px">'
             + '    <button class="btn small secondary" data-select-account="' + account.id + '">查看归档</button>'
             + '    <button class="btn small primary" data-sync-account="' + account.id + '">同步</button>'
+            + '    <button class="btn small secondary" data-set-group="' + account.id + '">分组</button>'
             + '    <button class="btn small warn" data-delete-account="' + account.id + '">删除</button>'
             + '  </div>'
             + '</div>';
@@ -847,7 +894,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '      <p>账号写入 D1，附件写入 R2，定时任务用 Microsoft Graph 增量拉取邮件。删除归档不会删除源邮箱中的邮件。</p>'
           + '    </div>'
           + '    <div class="hero-actions">'
-          + '      <button class="btn secondary" id="sync-all-btn">立即同步全部账号</button>'
+          + '      <button class="btn secondary" id="sync-all-btn">' + (state.syncingAll ? '正在启动同步...' : '一键后台同步全部') + '</button>'
           + '      <button class="btn warn" id="logout-btn">退出登录</button>'
           + '    </div>'
           + '  </section>'
@@ -865,15 +912,16 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '      <div class="panel-body stack">'
           + '        <form id="account-form" class="stack card" style="padding:14px">'
           + '          <label>邮箱地址（可选）<input id="account-email" placeholder="如果留空，会尝试从 Graph 自动识别" /></label>'
+          + '          <label>分组<input id="account-group" placeholder="默认分组 / 项目A / 客户B" /></label>'
           + '          <label>Client ID<input id="account-client-id" required placeholder="Azure App Client ID" /></label>'
           + '          <label>Refresh Token<textarea id="account-refresh-token" required placeholder="粘贴 refresh token"></textarea></label>'
           + '          <button class="btn primary" type="submit">保存账号</button>'
           + '        </form>'
           + '        <form id="bulk-account-form" class="stack card" style="padding:14px">'
-          + '          <div class="message-top"><div class="message-subject">批量导入</div><div class="muted">格式: 邮箱----密码----ClientID----RefreshToken</div></div>'
+          + '          <div class="message-top"><div class="message-subject">批量导入</div><div class="muted">格式: 邮箱----密码----ClientID----RefreshToken----分组</div></div>'
           + '          <label>选择 TXT 文件<input id="bulk-account-file" type="file" accept=".txt,.csv,text/plain" /></label>'
           + '          <label>批量文本<textarea id="bulk-account-input" placeholder="每行一个账号，示例：&#10;user@example.com----password----client-id----refresh-token"></textarea></label>'
-          + '          <div class="muted">第二段密码会被忽略，仅使用邮箱、ClientID 和 RefreshToken。</div>'
+          + '          <div class="muted">第二段密码会被忽略；第 5/6 段可作为分组，不填为默认分组。</div>'
           + '          <button class="btn primary" type="submit">批量导入账号</button>'
           + '        </form>'
           + '        <div class="account-list">' + (accountItems || '<div class="empty">还没有已保存的邮箱账号。</div>') + '</div>'
@@ -887,6 +935,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '            <label style="flex:1">账号<select id="filter-account"><option value="">全部</option>' + state.accounts.map(function (account) { return '<option value="' + account.id + '"' + (String(account.id) === String(state.filters.accountId) ? ' selected' : '') + '>' + escapeHtml(account.email) + '</option>'; }).join("") + '</select></label>'
           + '            <label style="width:150px">文件夹<select id="filter-folder"><option value="">全部</option><option value="inbox"' + (state.filters.folder === "inbox" ? ' selected' : '') + '>inbox</option><option value="junkemail"' + (state.filters.folder === "junkemail" ? ' selected' : '') + '>junkemail</option></select></label>'
           + '          </div>'
+          + '          <label>分组<select id="filter-group"><option value="">全部分组</option>' + groups.map(function (group) { return '<option value="' + escapeHtml(group) + '"' + (state.filters.group === group ? ' selected' : '') + '>' + escapeHtml(group) + '</option>'; }).join("") + '</select></label>'
           + '          <label>关键词<input id="filter-keyword" value="' + escapeHtml(state.filters.keyword || "") + '" placeholder="按主题、发件人或正文搜索" /></label>'
           + '          <button class="btn primary" type="submit">查询归档</button>'
           + '        </form>'
@@ -946,6 +995,12 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         Array.from(document.querySelectorAll("[data-sync-account]")).forEach(function (button) {
           button.onclick = async function () {
             await handleSyncAccount(button.getAttribute("data-sync-account"));
+          };
+        });
+
+        Array.from(document.querySelectorAll("[data-set-group]")).forEach(function (button) {
+          button.onclick = async function () {
+            await handleSetGroup(button.getAttribute("data-set-group"));
           };
         });
 

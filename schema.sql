@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
   email TEXT NOT NULL UNIQUE,
   client_id TEXT NOT NULL,
   refresh_token_encrypted TEXT NOT NULL,
+  group_name TEXT NOT NULL DEFAULT '默认分组',
   status TEXT NOT NULL DEFAULT 'active',
   last_sync_at TEXT,
   last_sync_status TEXT NOT NULL DEFAULT 'idle',

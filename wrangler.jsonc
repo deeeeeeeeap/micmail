@@ -11,6 +11,7 @@
     "SESSION_TTL_HOURS": "12",
     "SYNC_PAGE_SIZE": "50",
     "MAX_SYNC_PAGES": "40",
+    "SYNC_CONCURRENCY": "3",
     "SYNC_FOLDERS": "inbox,junkemail"
   },
   "d1_databases": [

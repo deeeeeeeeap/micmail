@@ -33,7 +33,7 @@ class HttpError extends Error {
   }
 }
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
 
@@ -93,7 +93,7 @@ async function handleRequest(request, env) {
   }
 
   if (path === "/api/sync/run" && request.method === "POST") {
-    return await syncAllAccountsRoute(env);
+    return await syncAllAccountsRoute(env, ctx);
   }
 
   if (path === "/api/messages" && request.method === "GET") {
@@ -218,7 +218,7 @@ async function sessionRoute(request, env) {
 
 async function listAccountsRoute(env) {
   const result = await env.DB.prepare(
-    `SELECT id, email, client_id, status, last_sync_at, last_sync_status, last_sync_error,
+    `SELECT id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error,
             created_at, updated_at
      FROM mail_accounts
      ORDER BY updated_at DESC, id DESC`,
@@ -232,6 +232,7 @@ async function createAccountRoute(request, env) {
   const clientId = requireString(body.clientId, "clientId");
   const refreshToken = requireString(body.refreshToken, "refreshToken");
   const emailInput = typeof body.email === "string" ? body.email.trim() : "";
+  const groupName = normalizeGroupName(body.groupName);
 
   let validation = { skipped: true, error: null };
   let profile = null;
@@ -258,17 +259,18 @@ async function createAccountRoute(request, env) {
 
   await env.DB.prepare(
     `INSERT INTO mail_accounts (
-      email, client_id, refresh_token_encrypted, status, created_at, updated_at
-    ) VALUES (?, ?, ?, 'active', ?, ?)
+      email, client_id, refresh_token_encrypted, group_name, status, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, 'active', ?, ?)
     ON CONFLICT(email) DO UPDATE SET
       client_id = excluded.client_id,
       refresh_token_encrypted = excluded.refresh_token_encrypted,
+      group_name = excluded.group_name,
       status = 'active',
       last_sync_status = 'idle',
       last_sync_error = NULL,
       updated_at = excluded.updated_at`,
   )
-    .bind(email, clientId, encryptedRefreshToken, now, now)
+    .bind(email, clientId, encryptedRefreshToken, groupName, now, now)
     .run();
 
   const account = await getAccountByEmail(env, email);
@@ -291,6 +293,7 @@ async function updateAccountRoute(request, env, accountId) {
   const body = await readJson(request);
   const email = typeof body.email === "string" && body.email.trim() ? body.email.trim() : existing.email;
   const status = typeof body.status === "string" && body.status.trim() ? body.status.trim() : existing.status;
+  const groupName = body.groupName !== undefined ? normalizeGroupName(body.groupName) : existing.group_name;
   let clientId = existing.client_id;
   let encryptedRefreshToken = existing.refresh_token_encrypted;
 
@@ -303,10 +306,10 @@ async function updateAccountRoute(request, env, accountId) {
   const now = new Date().toISOString();
   await env.DB.prepare(
     `UPDATE mail_accounts
-     SET email = ?, client_id = ?, refresh_token_encrypted = ?, status = ?, updated_at = ?
+     SET email = ?, client_id = ?, refresh_token_encrypted = ?, group_name = ?, status = ?, updated_at = ?
      WHERE id = ?`,
   )
-    .bind(email, clientId, encryptedRefreshToken, status, now, accountId)
+    .bind(email, clientId, encryptedRefreshToken, groupName, status, now, accountId)
     .run();
 
   return jsonResponse({
@@ -341,8 +344,22 @@ async function syncSingleAccountRoute(env, accountId) {
   return jsonResponse({ success: true, data: result });
 }
 
-async function syncAllAccountsRoute(env) {
-  const results = await syncAllAccounts(env);
+async function syncAllAccountsRoute(env, ctx) {
+  const urlStartedAt = new Date().toISOString();
+  const task = syncAllAccounts(env);
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(task);
+    return jsonResponse({
+      success: true,
+      data: {
+        status: "started",
+        startedAt: urlStartedAt,
+        message: "Full sync is running in the background.",
+      },
+    }, 202);
+  }
+
+  const results = await task;
   return jsonResponse({ success: true, data: results });
 }
 
@@ -363,6 +380,12 @@ async function listMessagesRoute(url, env) {
   if (folder) {
     filters.push("m.folder = ?");
     params.push(folder);
+  }
+
+  const groupName = url.searchParams.get("group");
+  if (groupName) {
+    filters.push("a.group_name = ?");
+    params.push(groupName);
   }
 
   const keyword = url.searchParams.get("keyword");
@@ -390,6 +413,7 @@ async function listMessagesRoute(url, env) {
   const totalRow = await env.DB.prepare(
     `SELECT COUNT(*) AS total
      FROM messages m
+     JOIN mail_accounts a ON a.id = m.account_id
      ${whereClause}`,
   )
     .bind(...params)
@@ -539,11 +563,9 @@ async function syncAllAccounts(env) {
      ORDER BY id ASC`,
   ).all();
 
-  const results = [];
-  for (const account of accounts.results ?? []) {
-    results.push(await syncAccount(env, account));
-  }
-  return results;
+  return await mapWithConcurrency(accounts.results ?? [], getSyncConcurrency(env), (account) =>
+    syncAccount(env, account),
+  );
 }
 
 async function syncAccount(env, account) {
@@ -554,6 +576,14 @@ async function syncAccount(env, account) {
      VALUES (?, 'running', ?, ?)`,
   )
     .bind(account.id, folderList.join(","), startedAt)
+    .run();
+
+  await env.DB.prepare(
+    `UPDATE mail_accounts
+     SET last_sync_status = 'running', last_sync_error = NULL, updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(startedAt, account.id)
     .run();
 
   let messageCount = 0;
@@ -590,7 +620,8 @@ async function syncAccount(env, account) {
 
       const accessToken = await refreshImapAccessToken(env, account.client_id, refreshToken);
       for (const folder of folderList) {
-        const syncResult = await syncImapFolderMessages(env, account, accessToken, folder);
+        const syncResult = await syncImapFolderMessages(env, account, accessToken, folder, cursorMap);
+        cursorMap["imap:" + folder + ":lastUid"] = syncResult.lastUid || cursorMap["imap:" + folder + ":lastUid"] || 0;
         messageCount += syncResult.messageCount;
       }
     }
@@ -1021,7 +1052,7 @@ async function graphFetchArrayBuffer(url, accessToken) {
   return await response.arrayBuffer();
 }
 
-async function syncImapFolderMessages(env, account, accessToken, folder) {
+async function syncImapFolderMessages(env, account, accessToken, folder, cursorMap = {}) {
   const client = await createImapClient("outlook.office365.com", 993);
   try {
     await client.readGreeting();
@@ -1031,12 +1062,20 @@ async function syncImapFolderMessages(env, account, accessToken, folder) {
     );
 
     const mailbox = await selectImapMailbox(client, folder);
-    const searchResponse = await client.command("UID SEARCH ALL", "OK");
-    const uids = parseImapSearchUids(searchResponse).slice(-getSyncPageSize(env));
+    const cursorKey = "imap:" + folder + ":lastUid";
+    const previousLastUid = clampInt(cursorMap[cursorKey], 0, 0);
+    const searchCommand = previousLastUid > 0
+      ? "UID SEARCH UID " + String(previousLastUid + 1) + ":*"
+      : "UID SEARCH ALL";
+    const searchResponse = await client.command(searchCommand, "OK");
+    const searchedUids = parseImapSearchUids(searchResponse)
+      .filter((uid) => uid > previousLastUid);
+    const uids = previousLastUid > 0 ? searchedUids : searchedUids.slice(-getSyncPageSize(env));
     let messageCount = 0;
+    let lastUid = previousLastUid;
 
     if (!uids.length) {
-      return { messageCount: 0, mailbox };
+      return { messageCount: 0, mailbox, lastUid };
     }
 
     for (const chunk of chunkArray(uids, 10)) {
@@ -1051,9 +1090,10 @@ async function syncImapFolderMessages(env, account, accessToken, folder) {
         await upsertMessage(env, account.id, folder, item);
         messageCount += 1;
       }
+      lastUid = Math.max(lastUid, ...chunk);
     }
 
-    return { messageCount, mailbox };
+    return { messageCount, mailbox, lastUid };
   } finally {
     await client.close();
   }
@@ -1477,6 +1517,18 @@ async function verifySchema(env) {
         ". Execute schema.sql in D1.",
     );
   }
+
+  await ensureMailAccountColumns(env);
+}
+
+async function ensureMailAccountColumns(env) {
+  const columnsResult = await env.DB.prepare("PRAGMA table_info(mail_accounts)").all();
+  const columns = new Set((columnsResult.results ?? []).map((row) => row.name));
+  if (!columns.has("group_name")) {
+    await env.DB.prepare(
+      "ALTER TABLE mail_accounts ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认分组'",
+    ).run();
+  }
 }
 
 function jsonResponse(payload, status = 200, extraHeaders = {}) {
@@ -1513,7 +1565,7 @@ function corsHeaders() {
 async function getAccountById(env, accountId, includeSecrets = false) {
   const columns = includeSecrets
     ? "*"
-    : "id, email, client_id, status, last_sync_at, last_sync_status, last_sync_error, created_at, updated_at";
+    : "id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error, created_at, updated_at";
   return await env.DB.prepare(
     "SELECT " + columns + " FROM mail_accounts WHERE id = ?",
   )
@@ -1523,7 +1575,7 @@ async function getAccountById(env, accountId, includeSecrets = false) {
 
 async function getAccountByEmail(env, email) {
   return await env.DB.prepare(
-    `SELECT id, email, client_id, status, last_sync_at, last_sync_status, last_sync_error,
+    `SELECT id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error,
             created_at, updated_at
      FROM mail_accounts
      WHERE email = ?`,
@@ -1548,6 +1600,10 @@ function getMaxSyncPages(env) {
   return clampInt(env.MAX_SYNC_PAGES, DEFAULT_MAX_SYNC_PAGES, 1, 500);
 }
 
+function getSyncConcurrency(env) {
+  return clampInt(env.SYNC_CONCURRENCY, 3, 1, 10);
+}
+
 function getSyncFolders(env) {
   const raw = typeof env.SYNC_FOLDERS === "string" ? env.SYNC_FOLDERS : "";
   const folders = raw
@@ -1563,6 +1619,25 @@ function clampInt(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.M
     return fallback;
   }
   return Math.min(max, Math.max(min, parsed));
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+function normalizeGroupName(value) {
+  const input = typeof value === "string" ? value.trim() : "";
+  return input || "默认分组";
 }
 
 function addHours(date, hours) {
