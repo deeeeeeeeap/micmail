@@ -104,7 +104,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       .app-grid {
         display: grid;
-        grid-template-columns: minmax(380px, 0.9fr) minmax(500px, 1.25fr) minmax(520px, 1.2fr);
+        grid-template-columns: minmax(360px, 0.92fr) minmax(470px, 1.12fr) minmax(500px, 1.2fr);
         min-height: 78vh;
         max-height: calc(100vh - 190px);
       }
@@ -189,6 +189,96 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       .stack {
         display: grid;
         gap: 12px;
+      }
+
+      .panel-body::-webkit-scrollbar,
+      .detail-frame::-webkit-scrollbar {
+        width: 10px;
+      }
+
+      .panel-body::-webkit-scrollbar-thumb,
+      .detail-frame::-webkit-scrollbar-thumb {
+        background: rgba(109, 120, 144, 0.36);
+        border-radius: 999px;
+        border: 3px solid transparent;
+        background-clip: content-box;
+      }
+
+      .collapsible-card {
+        padding: 0;
+        overflow: hidden;
+      }
+
+      .collapsible-card summary {
+        list-style: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 16px 18px;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .collapsible-card summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .collapsible-card summary::after {
+        content: "展开";
+        flex: 0 0 auto;
+        color: var(--brand-strong);
+        background: var(--brand-soft);
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 12px;
+      }
+
+      .collapsible-card[open] summary::after {
+        content: "收起";
+      }
+
+      .card-title {
+        display: grid;
+        gap: 3px;
+        min-width: 0;
+      }
+
+      .card-title strong {
+        font-size: 15px;
+        overflow-wrap: anywhere;
+      }
+
+      .card-title span {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .collapsible-body {
+        display: grid;
+        gap: 12px;
+        padding: 0 18px 18px;
+      }
+
+      .account-actions,
+      .message-actions {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      .message-actions {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .account-actions .btn,
+      .message-actions .btn {
+        width: 100%;
+        padding-left: 10px;
+        padding-right: 10px;
+        white-space: nowrap;
       }
 
       label {
@@ -296,6 +386,26 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         gap: 10px;
         align-items: center;
         flex-wrap: wrap;
+      }
+
+      .detail-meta {
+        align-items: flex-start;
+      }
+
+      .detail-heading {
+        flex: 1 1 340px;
+        min-width: 0;
+      }
+
+      .detail-title {
+        margin: 0;
+        line-height: 1.18;
+        letter-spacing: -0.02em;
+        overflow-wrap: anywhere;
+      }
+
+      .detail-actions {
+        justify-content: flex-end;
       }
 
       .account-email,
@@ -426,6 +536,27 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         }
       }
 
+      @media (min-width: 1181px) and (max-width: 1500px) {
+        .shell {
+          width: min(100vw - 16px, 1480px);
+        }
+
+        .app-grid {
+          grid-template-columns: minmax(330px, 0.92fr) minmax(430px, 1.08fr) minmax(420px, 1fr);
+        }
+
+        .hero {
+          padding-left: 22px;
+          padding-right: 22px;
+        }
+
+        .panel-head,
+        .panel-body {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+      }
+
       @media (max-width: 720px) {
         .shell {
           width: calc(100vw - 12px);
@@ -447,7 +578,9 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         .hero-actions,
         .toolbar,
         .form-row,
-        .detail-actions {
+        .detail-actions,
+        .account-actions,
+        .message-actions {
           width: 100%;
         }
 
@@ -457,6 +590,14 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         }
 
         .metric-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .account-actions {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .message-actions {
           grid-template-columns: 1fr;
         }
       }
@@ -909,7 +1050,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '  </div>'
             + '  <div class="account-meta">最近同步: ' + escapeHtml(formatDate(account.last_sync_at)) + '</div>'
             + (account.last_sync_error ? '<div class="account-meta">错误: ' + escapeHtml(shortText(account.last_sync_error, 120)) + '</div>' : '')
-            + '  <div class="toolbar" style="margin-top:12px">'
+            + '  <div class="account-actions">'
             + '    <button class="btn small secondary" data-select-account="' + account.id + '">查看归档</button>'
             + '    <button class="btn small primary" data-sync-account="' + account.id + '">同步</button>'
             + '    <button class="btn small secondary" data-set-group="' + account.id + '">分组</button>'
@@ -928,7 +1069,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '  </div>'
             + '  <div class="muted">' + escapeHtml(message.account_email || "") + ' · ' + escapeHtml(message.folder || "") + '</div>'
             + '  <div class="message-preview">' + escapeHtml(shortText(message.preview || "", 160)) + '</div>'
-            + '  <div class="toolbar" style="margin-top:12px">'
+            + '  <div class="message-actions">'
             + '    <button class="btn small secondary" data-toggle-read="' + message.id + '" data-target-read="' + (message.is_read ? '0' : '1') + '">' + (message.is_read ? '标记未读' : '标记已读') + '</button>'
             + '    <button class="btn small warn" data-delete-message="' + message.id + '">删除归档</button>'
             + '  </div>'
@@ -956,8 +1097,8 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           ? ''
             + '<div class="detail-wrap">'
             + '  <div class="detail-meta">'
-            + '    <div>'
-            + '      <h2 style="margin:0">' + escapeHtml(detail.subject || "(无主题)") + '</h2>'
+            + '    <div class="detail-heading">'
+            + '      <h2 class="detail-title">' + escapeHtml(detail.subject || "(无主题)") + '</h2>'
             + '      <div class="muted">来自 ' + escapeHtml(detail.from_name || detail.from_address || "未知发件人") + ' · ' + escapeHtml(detail.account_email || "") + '</div>'
             + '      <div class="muted">收到时间 ' + escapeHtml(formatDate(detail.received_at)) + '</div>'
             + '    </div>'
@@ -999,20 +1140,26 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '    <div class="panel">'
           + '      <div class="panel-head"><h3>邮箱账号</h3><p>保存 OAuth 凭据、设置分组，并触发单账号同步。</p></div>'
           + '      <div class="panel-body stack">'
-          + '        <form id="account-form" class="stack card" style="padding:14px">'
+          + '        <details class="card collapsible-card" open>'
+          + '          <summary><span class="card-title"><strong>保存单个账号</strong><span>粘贴邮箱 OAuth refresh token，保存后可立即同步。</span></span></summary>'
+          + '          <form id="account-form" class="collapsible-body">'
           + '          <label>邮箱地址（可选）<input id="account-email" placeholder="如果留空，会尝试从 Graph 自动识别" /></label>'
           + '          <label>分组<input id="account-group" placeholder="默认分组 / 项目A / 客户B" /></label>'
           + '          <label>Client ID<input id="account-client-id" required placeholder="Azure App Client ID" /></label>'
           + '          <label>Refresh Token<textarea id="account-refresh-token" required placeholder="粘贴 refresh token"></textarea></label>'
           + '          <button class="btn primary" type="submit">保存账号</button>'
-          + '        </form>'
-          + '        <form id="bulk-account-form" class="stack card" style="padding:14px">'
-          + '          <div class="message-top"><div class="message-subject">批量导入</div><div class="muted">格式: 邮箱----密码----ClientID----RefreshToken----分组</div></div>'
+          + '          </form>'
+          + '        </details>'
+          + '        <details class="card collapsible-card">'
+          + '          <summary><span class="card-title"><strong>批量导入账号</strong><span>支持 TXT / CSV 或直接粘贴，一行一个账号。</span></span></summary>'
+          + '          <form id="bulk-account-form" class="collapsible-body">'
+          + '          <div class="muted">格式: 邮箱----密码----ClientID----RefreshToken----分组</div>'
           + '          <label>选择 TXT 文件<input id="bulk-account-file" type="file" accept=".txt,.csv,text/plain" /></label>'
           + '          <label>批量文本<textarea id="bulk-account-input" placeholder="每行一个账号，示例：&#10;user@example.com----password----client-id----refresh-token"></textarea></label>'
           + '          <div class="muted">第二段密码会被忽略；第 5/6 段可作为分组，不填为默认分组。</div>'
           + '          <button class="btn primary" type="submit">批量导入账号</button>'
-          + '        </form>'
+          + '          </form>'
+          + '        </details>'
           + '        <div class="account-list">' + (accountItems || '<div class="empty">还没有已保存的邮箱账号。</div>') + '</div>'
           + '      </div>'
           + '    </div>'
