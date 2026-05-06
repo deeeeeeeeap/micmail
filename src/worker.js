@@ -1,4 +1,5 @@
 import { APP_HTML } from "./ui.js";
+import { connect } from "cloudflare:sockets";
 const SESSION_COOKIE = "mail_admin_session";
 const DEFAULT_SESSION_TTL_HOURS = 12;
 const DEFAULT_RETENTION_DAYS = 90;
@@ -232,16 +233,21 @@ async function createAccountRoute(request, env) {
   const refreshToken = requireString(body.refreshToken, "refreshToken");
   const emailInput = typeof body.email === "string" ? body.email.trim() : "";
 
-  let accessToken;
-  let profile;
-  try {
-    const verified = await verifyMicrosoftAccount(env, clientId, refreshToken);
-    accessToken = verified.accessToken;
-    profile = verified.profile;
-  } catch (error) {
-    throw new HttpError(400, "Microsoft account validation failed: " + summarizeUpstreamError(error));
+  let validation = { skipped: true, error: null };
+  let profile = null;
+  if (!emailInput) {
+    try {
+      const verified = await verifyMicrosoftAccount(env, clientId, refreshToken);
+      profile = verified.profile;
+      validation = { skipped: false, error: null };
+    } catch (error) {
+      throw new HttpError(
+        400,
+        "Email is required when Microsoft validation fails: " + summarizeUpstreamError(error),
+      );
+    }
   }
-  const email = emailInput || profile.mail || profile.userPrincipalName;
+  const email = emailInput || profile?.mail || profile?.userPrincipalName;
 
   if (!email) {
     throw new HttpError(400, "Unable to determine account email.");
@@ -258,6 +264,7 @@ async function createAccountRoute(request, env) {
       client_id = excluded.client_id,
       refresh_token_encrypted = excluded.refresh_token_encrypted,
       status = 'active',
+      last_sync_status = 'idle',
       last_sync_error = NULL,
       updated_at = excluded.updated_at`,
   )
@@ -270,11 +277,7 @@ async function createAccountRoute(request, env) {
     success: true,
     data: {
       account,
-      validatedAs: {
-        displayName: profile.displayName ?? null,
-        userPrincipalName: profile.userPrincipalName ?? null,
-      },
-      tokenPreview: maskToken(accessToken),
+      validation,
     },
   });
 }
@@ -294,11 +297,6 @@ async function updateAccountRoute(request, env, accountId) {
   if (body.clientId || body.refreshToken) {
     clientId = requireString(body.clientId ?? existing.client_id, "clientId");
     const refreshToken = requireString(body.refreshToken, "refreshToken");
-    try {
-      await verifyMicrosoftAccount(env, clientId, refreshToken);
-    } catch (error) {
-      throw new HttpError(400, "Microsoft account validation failed: " + summarizeUpstreamError(error));
-    }
     encryptedRefreshToken = await encryptText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
   }
 
@@ -567,13 +565,34 @@ async function syncAccount(env, account) {
       account.refresh_token_encrypted,
       env.TOKEN_ENCRYPTION_SECRET,
     );
-    const accessToken = await refreshAccessToken(env, account.client_id, refreshToken);
+    let syncMode = "graph";
+    try {
+      const accessToken = await refreshAccessToken(
+        env,
+        account.client_id,
+        refreshToken,
+        "https://graph.microsoft.com/.default offline_access",
+      );
 
-    for (const folder of folderList) {
-      const syncResult = await syncFolderMessages(env, account, accessToken, folder, cursorMap);
-      cursorMap[folder] = syncResult.cursor;
-      messageCount += syncResult.messageCount;
-      attachmentCount += syncResult.attachmentCount;
+      for (const folder of folderList) {
+        const syncResult = await syncFolderMessages(env, account, accessToken, folder, cursorMap);
+        cursorMap[folder] = syncResult.cursor;
+        messageCount += syncResult.messageCount;
+        attachmentCount += syncResult.attachmentCount;
+      }
+    } catch (graphError) {
+      syncMode = "imap";
+      logInfo("graph_sync_failed_try_imap", {
+        accountId: account.id,
+        email: account.email,
+        error: summarizeUpstreamError(graphError),
+      });
+
+      const accessToken = await refreshImapAccessToken(env, account.client_id, refreshToken);
+      for (const folder of folderList) {
+        const syncResult = await syncImapFolderMessages(env, account, accessToken, folder);
+        messageCount += syncResult.messageCount;
+      }
     }
 
     const finishedAt = new Date().toISOString();
@@ -597,6 +616,7 @@ async function syncAccount(env, account) {
     logInfo("sync_success", {
       accountId: account.id,
       email: account.email,
+      syncMode,
       messageCount,
       attachmentCount,
     });
@@ -605,6 +625,7 @@ async function syncAccount(env, account) {
       accountId: account.id,
       email: account.email,
       status: "success",
+      syncMode,
       messageCount,
       attachmentCount,
       finishedAt,
@@ -899,7 +920,7 @@ async function verifyMicrosoftAccount(env, clientId, refreshToken) {
   return { accessToken, profile };
 }
 
-async function refreshAccessToken(env, clientId, refreshToken) {
+async function refreshAccessToken(env, clientId, refreshToken, scope = null) {
   const tenantId = env.MICROSOFT_TENANT_ID || "common";
   const url =
     "https://login.microsoftonline.com/" +
@@ -909,7 +930,9 @@ async function refreshAccessToken(env, clientId, refreshToken) {
   body.set("client_id", clientId);
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", refreshToken);
-  body.set("scope", "https://graph.microsoft.com/.default offline_access");
+  if (scope) {
+    body.set("scope", scope);
+  }
 
   const response = await fetch(url, {
     method: "POST",
@@ -928,6 +951,25 @@ async function refreshAccessToken(env, clientId, refreshToken) {
   }
 
   return payload.access_token;
+}
+
+async function refreshImapAccessToken(env, clientId, refreshToken) {
+  const attempts = [
+    null,
+    "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+    "https://outlook.office.com/.default offline_access",
+  ];
+  const errors = [];
+
+  for (const scope of attempts) {
+    try {
+      return await refreshAccessToken(env, clientId, refreshToken, scope);
+    } catch (error) {
+      errors.push(scope ? scope + ": " + summarizeUpstreamError(error) : "original scope: " + summarizeUpstreamError(error));
+    }
+  }
+
+  throw new Error("Unable to refresh IMAP access token. " + errors.join(" | "));
 }
 
 function buildDeltaUrl(env, folder) {
@@ -977,6 +1019,342 @@ async function graphFetchArrayBuffer(url, accessToken) {
   }
 
   return await response.arrayBuffer();
+}
+
+async function syncImapFolderMessages(env, account, accessToken, folder) {
+  const client = await createImapClient("outlook.office365.com", 993);
+  try {
+    await client.readGreeting();
+    await client.command(
+      "AUTHENTICATE XOAUTH2 " + makeXoauth2Token(account.email, accessToken),
+      "OK",
+    );
+
+    const mailbox = await selectImapMailbox(client, folder);
+    const searchResponse = await client.command("UID SEARCH ALL", "OK");
+    const uids = parseImapSearchUids(searchResponse).slice(-getSyncPageSize(env));
+    let messageCount = 0;
+
+    if (!uids.length) {
+      return { messageCount: 0, mailbox };
+    }
+
+    for (const chunk of chunkArray(uids, 10)) {
+      const response = await client.command(
+        "UID FETCH " + chunk.join(",") + " (UID FLAGS INTERNALDATE BODY.PEEK[])",
+        "OK",
+        20,
+      );
+      const rawMessages = extractImapLiteralBodies(response);
+      for (const rawMessage of rawMessages) {
+        const item = parseRawEmailToGraphLikeItem(rawMessage, account.email, folder);
+        await upsertMessage(env, account.id, folder, item);
+        messageCount += 1;
+      }
+    }
+
+    return { messageCount, mailbox };
+  } finally {
+    await client.close();
+  }
+}
+
+async function createImapClient(hostname, port) {
+  const socket = connect(
+    { hostname, port },
+    { secureTransport: "on" },
+  );
+  const reader = socket.readable.getReader();
+  const writer = socket.writable.getWriter();
+  const decoder = new TextDecoder();
+  const textEncoder = new TextEncoder();
+  let tagIndex = 1;
+
+  async function readUntil(pattern, maxChunks = 10) {
+    let text = "";
+    for (let i = 0; i < maxChunks; i += 1) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+      text += decoder.decode(value, { stream: true });
+      if (pattern.test(text)) {
+        return text;
+      }
+    }
+    throw new Error("IMAP response did not complete.");
+  }
+
+  async function writeLine(line) {
+    await writer.write(textEncoder.encode(line + "\r\n"));
+  }
+
+  return {
+    async readGreeting() {
+      return await readUntil(/\* OK/i, 5);
+    },
+    async command(commandText, expected = "OK", maxChunks = 10) {
+      const tag = "A" + String(tagIndex++).padStart(4, "0");
+      await writeLine(tag + " " + commandText);
+      const response = await readUntil(
+        new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"),
+        maxChunks,
+      );
+      const statusMatch = response.match(new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"));
+      const status = statusMatch ? statusMatch[1].toUpperCase() : "";
+      if (expected && status !== expected) {
+        throw new Error("IMAP command failed: " + summarizeImapResponse(response));
+      }
+      return response;
+    },
+    async close() {
+      try {
+        await writeLine("A9999 LOGOUT");
+      } catch {
+        // Ignore close failures.
+      }
+      try {
+        writer.releaseLock();
+        reader.releaseLock();
+      } catch {
+        // Ignore lock release failures.
+      }
+      try {
+        await socket.close();
+      } catch {
+        // Ignore socket close failures.
+      }
+    },
+  };
+}
+
+async function selectImapMailbox(client, folder) {
+  const candidates = folder === "junkemail"
+    ? ["Junk", "Junk Email", "Junk E-mail"]
+    : ["INBOX"];
+
+  const errors = [];
+  for (const mailbox of candidates) {
+    try {
+      await client.command('SELECT "' + mailbox.replace(/"/g, '\\"') + '"', "OK");
+      return mailbox;
+    } catch (error) {
+      errors.push(mailbox + ": " + summarizeUpstreamError(error));
+    }
+  }
+
+  throw new Error("Unable to select IMAP folder " + folder + ". " + errors.join(" | "));
+}
+
+function makeXoauth2Token(email, accessToken) {
+  return btoa("user=" + email + "\x01auth=Bearer " + accessToken + "\x01\x01");
+}
+
+function parseImapSearchUids(response) {
+  const match = response.match(/\* SEARCH ([\d\s]*)/i);
+  if (!match) {
+    return [];
+  }
+  return match[1]
+    .trim()
+    .split(/\s+/)
+    .map((value) => Number.parseInt(value, 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+}
+
+function extractImapLiteralBodies(response) {
+  const bodies = [];
+  const literalPattern = /\{(\d+)\}\r?\n/g;
+  let match;
+  while ((match = literalPattern.exec(response))) {
+    const length = Number.parseInt(match[1], 10);
+    if (!Number.isInteger(length) || length <= 0) {
+      continue;
+    }
+    const start = match.index + match[0].length;
+    bodies.push(response.slice(start, start + length));
+    literalPattern.lastIndex = start + length;
+  }
+  return bodies;
+}
+
+function parseRawEmailToGraphLikeItem(rawMessage, accountEmail, folder) {
+  const headerEnd = rawMessage.search(/\r?\n\r?\n/);
+  const rawHeaders = headerEnd >= 0 ? rawMessage.slice(0, headerEnd) : rawMessage;
+  const rawBody = headerEnd >= 0 ? rawMessage.slice(headerEnd).trim() : "";
+  const headers = parseEmailHeaders(rawHeaders);
+  const from = parseEmailAddress(headers.from || "");
+  const date = headers.date ? new Date(headers.date) : new Date();
+  const receivedDateTime = Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
+  const subject = decodeMimeWords(headers.subject || "");
+  const body = extractEmailBody(rawHeaders, rawBody);
+  const messageId = headers["message-id"] || shaLikeId(accountEmail + ":" + folder + ":" + subject + ":" + receivedDateTime);
+
+  return {
+    id: "imap:" + messageId,
+    internetMessageId: messageId,
+    subject,
+    from: {
+      emailAddress: {
+        address: from.address,
+        name: from.name,
+      },
+    },
+    receivedDateTime,
+    body: {
+      contentType: body.contentType,
+      content: body.content,
+    },
+    isRead: true,
+    hasAttachments: false,
+    webLink: null,
+  };
+}
+
+function parseEmailHeaders(rawHeaders) {
+  const result = {};
+  const unfolded = rawHeaders.replace(/\r?\n[ \t]+/g, " ");
+  for (const line of unfolded.split(/\r?\n/)) {
+    const index = line.indexOf(":");
+    if (index === -1) {
+      continue;
+    }
+    result[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+  }
+  return result;
+}
+
+function parseEmailAddress(value) {
+  const decoded = decodeMimeWords(value);
+  const match = decoded.match(/^(.*)<([^>]+)>$/);
+  if (match) {
+    return {
+      name: match[1].replace(/"/g, "").trim(),
+      address: match[2].trim(),
+    };
+  }
+  return {
+    name: "",
+    address: decoded.trim(),
+  };
+}
+
+function extractEmailBody(rawHeaders, rawBody) {
+  const contentType = parseContentType(rawHeaders);
+  if (contentType.boundary) {
+    const parts = rawBody.split("--" + contentType.boundary);
+    const htmlPart = parts.find((part) => /content-type:\s*text\/html/i.test(part));
+    const textPart = parts.find((part) => /content-type:\s*text\/plain/i.test(part));
+    if (htmlPart) {
+      return { contentType: "html", content: decodeEmailPart(htmlPart) };
+    }
+    if (textPart) {
+      return { contentType: "text", content: escapeTextAsHtml(decodeEmailPart(textPart)) };
+    }
+  }
+
+  if (contentType.value.includes("text/html")) {
+    return { contentType: "html", content: decodeBodyByHeaders(rawHeaders, rawBody) };
+  }
+
+  return { contentType: "text", content: escapeTextAsHtml(decodeBodyByHeaders(rawHeaders, rawBody)) };
+}
+
+function parseContentType(rawHeaders) {
+  const headers = parseEmailHeaders(rawHeaders);
+  const value = String(headers["content-type"] || "text/plain").toLowerCase();
+  const boundaryMatch = String(headers["content-type"] || "").match(/boundary="?([^";]+)"?/i);
+  return {
+    value,
+    boundary: boundaryMatch ? boundaryMatch[1] : "",
+  };
+}
+
+function decodeEmailPart(part) {
+  const splitIndex = part.search(/\r?\n\r?\n/);
+  if (splitIndex === -1) {
+    return part.trim();
+  }
+  const headers = part.slice(0, splitIndex);
+  const body = part.slice(splitIndex).trim();
+  return decodeBodyByHeaders(headers, body);
+}
+
+function decodeBodyByHeaders(rawHeaders, body) {
+  const headers = parseEmailHeaders(rawHeaders);
+  const encoding = String(headers["content-transfer-encoding"] || "").toLowerCase();
+  if (encoding.includes("base64")) {
+    try {
+      return new TextDecoder().decode(base64ToUint8(body.replace(/\s+/g, "")));
+    } catch {
+      return body;
+    }
+  }
+  if (encoding.includes("quoted-printable")) {
+    return decodeQuotedPrintable(body);
+  }
+  return body;
+}
+
+function decodeMimeWords(value) {
+  return String(value).replace(/=\?([^?]+)\?([BQ])\?([^?]+)\?=/gi, (_match, charset, encoding, text) => {
+    try {
+      const bytes = encoding.toUpperCase() === "B"
+        ? base64ToUint8(text)
+        : quotedPrintableToBytes(text.replace(/_/g, " "));
+      return new TextDecoder(charset).decode(bytes);
+    } catch {
+      return text;
+    }
+  });
+}
+
+function decodeQuotedPrintable(value) {
+  try {
+    return new TextDecoder().decode(quotedPrintableToBytes(value));
+  } catch {
+    return value;
+  }
+}
+
+function quotedPrintableToBytes(value) {
+  const normalized = String(value)
+    .replace(/=\r?\n/g, "")
+    .replace(/=([0-9A-F]{2})/gi, (_match, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+  return Uint8Array.from(normalized, (char) => char.charCodeAt(0));
+}
+
+function escapeTextAsHtml(value) {
+  return "<pre style=\"white-space:pre-wrap;font-family:inherit\">" + escapeHtml(value) + "</pre>";
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function shaLikeId(value) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+  }
+  return "generated-" + hash.toString(16);
+}
+
+function summarizeImapResponse(response) {
+  return response.replace(/\s+/g, " ").slice(-600);
 }
 
 async function getSession(request, env) {
