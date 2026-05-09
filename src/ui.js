@@ -114,7 +114,6 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         display: grid;
         grid-template-columns: minmax(360px, 0.92fr) minmax(470px, 1.12fr) minmax(500px, 1.2fr);
         min-height: 78vh;
-        max-height: calc(100vh - 190px);
       }
 
       .panel {
@@ -123,7 +122,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         background: rgba(255, 255, 255, 0.5);
         display: flex;
         flex-direction: column;
-        overflow: hidden;
+        overflow: visible;
       }
 
       .panel:last-child {
@@ -153,7 +152,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
 
       .panel-body {
         padding: 18px 24px 26px;
-        overflow: auto;
+        overflow: visible;
         min-width: 0;
         min-height: 0;
       }
@@ -535,13 +534,11 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       @media (max-width: 1180px) {
         .app-grid {
           grid-template-columns: 1fr;
-          max-height: none;
         }
 
         .panel {
           border-right: none;
           border-bottom: 1px solid var(--line);
-          max-height: none;
         }
 
         .panel:last-child {
