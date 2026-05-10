@@ -8,6 +8,8 @@ const DEFAULT_MAX_SYNC_PAGES = 40;
 const DEFAULT_SYNC_FOLDERS = ["inbox", "junkemail"];
 const DEFAULT_AUTO_SYNC_STALE_MINUTES = 30;
 const DEFAULT_TRANSIENT_RETRY_MINUTES = 20;
+const DEFAULT_QUEUED_STALE_MINUTES = 10;
+const DEFAULT_RUNNING_STALE_MINUTES = 60;
 const encoder = new TextEncoder();
 
 let schemaPromise;
@@ -346,6 +348,18 @@ async function syncSingleAccountRoute(env, accountId) {
     throw new HttpError(404, "Account not found.");
   }
 
+  if (isFreshSyncInProgress(env, account, new Date())) {
+    return jsonResponse({
+      success: true,
+      data: {
+        accountId: account.id,
+        email: account.email,
+        status: account.last_sync_status,
+        message: "Account sync is already queued or running.",
+      },
+    }, 202);
+  }
+
   const result = await syncAccount(env, account);
   return jsonResponse({ success: true, data: result });
 }
@@ -371,7 +385,7 @@ async function syncAllAccountsRoute(env, ctx) {
 
 async function syncAutoAccountsRoute(env, ctx) {
   const startedAt = new Date().toISOString();
-  const accounts = await getAutoSyncAccounts(env);
+  const accounts = await claimAutoSyncAccounts(env);
   const task = syncAccounts(env, accounts, 1);
 
   if (ctx?.waitUntil) {
@@ -586,11 +600,11 @@ async function runScheduledMaintenance(env, cron) {
 }
 
 async function syncAllAccounts(env) {
-  return await syncAccounts(env, await getActiveAccounts(env), getSyncConcurrency(env));
+  return await syncAccounts(env, await getManualSyncAccounts(env), getSyncConcurrency(env));
 }
 
 async function syncAutoAccounts(env) {
-  return await syncAccounts(env, await getAutoSyncAccounts(env), 1);
+  return await syncAccounts(env, await claimAutoSyncAccounts(env), 1);
 }
 
 async function getActiveAccounts(env) {
@@ -603,10 +617,45 @@ async function getActiveAccounts(env) {
   return accounts.results ?? [];
 }
 
-async function getAutoSyncAccounts(env) {
+async function getManualSyncAccounts(env) {
   const now = new Date();
   const accounts = await getActiveAccounts(env);
-  return accounts.filter((account) => shouldAutoSyncAccount(env, account, now));
+  return accounts.filter((account) => !isFreshSyncInProgress(env, account, now));
+}
+
+async function claimAutoSyncAccounts(env) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const queuedStaleBefore = minutesAgoIso(now, getQueuedStaleMinutes(env));
+  const runningStaleBefore = minutesAgoIso(now, getRunningStaleMinutes(env));
+  const candidates = await getActiveAccounts(env);
+  const claimed = [];
+
+  for (const account of candidates) {
+    if (!shouldAutoSyncAccount(env, account, now)) {
+      continue;
+    }
+
+    const result = await env.DB.prepare(
+      `UPDATE mail_accounts
+       SET last_sync_status = 'queued', updated_at = ?
+       WHERE id = ?
+         AND status = 'active'
+         AND (
+           last_sync_status NOT IN ('running', 'queued')
+           OR (last_sync_status = 'queued' AND updated_at <= ?)
+           OR (last_sync_status = 'running' AND updated_at <= ?)
+         )`,
+    )
+      .bind(nowIso, account.id, queuedStaleBefore, runningStaleBefore)
+      .run();
+
+    if (result.meta?.changes) {
+      claimed.push({ ...account, last_sync_status: "queued" });
+    }
+  }
+
+  return claimed;
 }
 
 async function syncAccounts(env, accounts, concurrency) {
@@ -617,8 +666,12 @@ async function syncAccounts(env, accounts, concurrency) {
 
 function shouldAutoSyncAccount(env, account, now) {
   const status = account.last_sync_status || "idle";
-  if (status === "running" || status === "queued") {
-    return false;
+  if (status === "queued") {
+    return minutesSince(account.updated_at, now) >= getQueuedStaleMinutes(env);
+  }
+
+  if (status === "running") {
+    return minutesSince(account.updated_at, now) >= getRunningStaleMinutes(env);
   }
 
   if (!account.last_sync_at) {
@@ -635,6 +688,17 @@ function shouldAutoSyncAccount(env, account, now) {
   }
 
   return lastSyncAge >= getAutoSyncStaleMinutes(env);
+}
+
+function isFreshSyncInProgress(env, account, now) {
+  const status = account.last_sync_status || "idle";
+  if (status === "queued") {
+    return minutesSince(account.updated_at, now) < getQueuedStaleMinutes(env);
+  }
+  if (status === "running") {
+    return minutesSince(account.updated_at, now) < getRunningStaleMinutes(env);
+  }
+  return false;
 }
 
 async function syncAccount(env, account) {
@@ -1684,6 +1748,14 @@ function getTransientRetryMinutes(env) {
   return clampInt(env.TRANSIENT_RETRY_MINUTES, DEFAULT_TRANSIENT_RETRY_MINUTES, 5, 24 * 60);
 }
 
+function getQueuedStaleMinutes(env) {
+  return clampInt(env.QUEUED_STALE_MINUTES, DEFAULT_QUEUED_STALE_MINUTES, 5, 24 * 60);
+}
+
+function getRunningStaleMinutes(env) {
+  return clampInt(env.RUNNING_STALE_MINUTES, DEFAULT_RUNNING_STALE_MINUTES, 15, 24 * 60);
+}
+
 function getSyncFolders(env) {
   const raw = typeof env.SYNC_FOLDERS === "string" ? env.SYNC_FOLDERS : "";
   const folders = raw
@@ -1707,6 +1779,10 @@ function minutesSince(value, now = new Date()) {
     return Number.POSITIVE_INFINITY;
   }
   return Math.max(0, (now.getTime() - time) / 60000);
+}
+
+function minutesAgoIso(now, minutes) {
+  return new Date(now.getTime() - minutes * 60000).toISOString();
 }
 
 function isTransientSyncError(error) {

@@ -798,6 +798,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const transientError = rawStatus === "error" && isTransientSyncError(account.last_sync_error);
         const status = transientError ? "pending_retry" : rawStatus;
         if (status === "success") return { className: "status-pill success", label: "正常", errorPrefix: "提示" };
+        if (status === "queued") return { className: "status-pill waiting", label: "已排队", errorPrefix: "提示" };
         if (status === "running") return { className: "status-pill waiting", label: "同步中", errorPrefix: "提示" };
         if (status === "pending_retry") return { className: "status-pill waiting", label: "等待重试", errorPrefix: "原因" };
         if (status === "error") return { className: "status-pill error", label: "error", errorPrefix: "错误" };
@@ -1157,10 +1158,14 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         state.busy = true;
         try {
           setNotice("正在同步所选账号...");
-          await api("/api/accounts/" + accountId + "/sync", { method: "POST", body: "{}" });
+          const result = await api("/api/accounts/" + accountId + "/sync", { method: "POST", body: "{}" });
           await refreshDashboard();
           state.busy = false;
-          setNotice("账号同步已完成。");
+          if (result.status === "queued" || result.status === "running") {
+            setNotice("账号已经在同步队列中，请等待后台自动刷新状态。");
+          } else {
+            setNotice("账号同步已完成。");
+          }
         } catch (error) {
           state.busy = false;
           setNotice(error.message, "error");
