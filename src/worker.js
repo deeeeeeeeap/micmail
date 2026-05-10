@@ -6,6 +6,8 @@ const DEFAULT_RETENTION_DAYS = 90;
 const DEFAULT_SYNC_PAGE_SIZE = 50;
 const DEFAULT_MAX_SYNC_PAGES = 40;
 const DEFAULT_SYNC_FOLDERS = ["inbox", "junkemail"];
+const DEFAULT_AUTO_SYNC_STALE_MINUTES = 30;
+const DEFAULT_TRANSIENT_RETRY_MINUTES = 20;
 const encoder = new TextEncoder();
 
 let schemaPromise;
@@ -94,6 +96,10 @@ async function handleRequest(request, env, ctx) {
 
   if (path === "/api/sync/run" && request.method === "POST") {
     return await syncAllAccountsRoute(env, ctx);
+  }
+
+  if (path === "/api/sync/auto" && request.method === "POST") {
+    return await syncAutoAccountsRoute(env, ctx);
   }
 
   if (path === "/api/messages" && request.method === "GET") {
@@ -363,6 +369,30 @@ async function syncAllAccountsRoute(env, ctx) {
   return jsonResponse({ success: true, data: results });
 }
 
+async function syncAutoAccountsRoute(env, ctx) {
+  const startedAt = new Date().toISOString();
+  const accounts = await getAutoSyncAccounts(env);
+  const task = syncAccounts(env, accounts, 1);
+
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(task);
+    return jsonResponse({
+      success: true,
+      data: {
+        status: "started",
+        queued: accounts.length,
+        startedAt,
+        message: accounts.length
+          ? "Auto sync is running in the background."
+          : "No account needs auto sync right now.",
+      },
+    }, 202);
+  }
+
+  const results = await task;
+  return jsonResponse({ success: true, data: { queued: accounts.length, results } });
+}
+
 async function listMessagesRoute(url, env) {
   const page = clampInt(url.searchParams.get("page"), 1, 1);
   const pageSize = clampInt(url.searchParams.get("pageSize"), 25, 1, 100);
@@ -551,21 +581,60 @@ async function runScheduledMaintenance(env, cron) {
   logInfo("scheduled_start", { cron });
   await cleanupExpiredSessions(env);
   await cleanupExpiredArchive(env);
-  await syncAllAccounts(env);
+  await syncAutoAccounts(env);
   logInfo("scheduled_complete", { cron });
 }
 
 async function syncAllAccounts(env) {
+  return await syncAccounts(env, await getActiveAccounts(env), getSyncConcurrency(env));
+}
+
+async function syncAutoAccounts(env) {
+  return await syncAccounts(env, await getAutoSyncAccounts(env), 1);
+}
+
+async function getActiveAccounts(env) {
   const accounts = await env.DB.prepare(
     `SELECT *
      FROM mail_accounts
      WHERE status = 'active'
      ORDER BY id ASC`,
   ).all();
+  return accounts.results ?? [];
+}
 
-  return await mapWithConcurrency(accounts.results ?? [], getSyncConcurrency(env), (account) =>
+async function getAutoSyncAccounts(env) {
+  const now = new Date();
+  const accounts = await getActiveAccounts(env);
+  return accounts.filter((account) => shouldAutoSyncAccount(env, account, now));
+}
+
+async function syncAccounts(env, accounts, concurrency) {
+  return await mapWithConcurrency(accounts, concurrency, (account) =>
     syncAccount(env, account),
   );
+}
+
+function shouldAutoSyncAccount(env, account, now) {
+  const status = account.last_sync_status || "idle";
+  if (status === "running" || status === "queued") {
+    return false;
+  }
+
+  if (!account.last_sync_at) {
+    return true;
+  }
+
+  const lastSyncAge = minutesSince(account.last_sync_at, now);
+  if (status === "pending_retry" || (status === "error" && isTransientSyncError(account.last_sync_error))) {
+    return lastSyncAge >= getTransientRetryMinutes(env);
+  }
+
+  if (status === "error") {
+    return false;
+  }
+
+  return lastSyncAge >= getAutoSyncStaleMinutes(env);
 }
 
 async function syncAccount(env, account) {
@@ -663,12 +732,14 @@ async function syncAccount(env, account) {
     };
   } catch (error) {
     const finishedAt = new Date().toISOString();
+    const syncError = summarizeUpstreamError(error);
+    const failureStatus = isTransientSyncError(syncError) ? "pending_retry" : "error";
     await env.DB.prepare(
       `UPDATE mail_accounts
-       SET last_sync_at = ?, last_sync_status = 'error', last_sync_error = ?, updated_at = ?
+       SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?, updated_at = ?
        WHERE id = ?`,
     )
-      .bind(finishedAt, error.message, finishedAt, account.id)
+      .bind(finishedAt, failureStatus, syncError, finishedAt, account.id)
       .run();
 
     await env.DB.prepare(
@@ -676,22 +747,23 @@ async function syncAccount(env, account) {
        SET status = 'error', finished_at = ?, message_count = ?, attachment_count = ?, error_text = ?
        WHERE id = ?`,
     )
-      .bind(finishedAt, messageCount, attachmentCount, error.message, syncRun.meta.last_row_id)
+      .bind(finishedAt, messageCount, attachmentCount, syncError, syncRun.meta.last_row_id)
       .run();
 
     logInfo("sync_error", {
       accountId: account.id,
       email: account.email,
-      error: error.message,
+      status: failureStatus,
+      error: syncError,
     });
 
     return {
       accountId: account.id,
       email: account.email,
-      status: "error",
+      status: failureStatus,
       messageCount,
       attachmentCount,
-      error: error.message,
+      error: syncError,
       finishedAt,
     };
   }
@@ -1604,6 +1676,14 @@ function getSyncConcurrency(env) {
   return clampInt(env.SYNC_CONCURRENCY, 3, 1, 10);
 }
 
+function getAutoSyncStaleMinutes(env) {
+  return clampInt(env.AUTO_SYNC_STALE_MINUTES, DEFAULT_AUTO_SYNC_STALE_MINUTES, 5, 24 * 60);
+}
+
+function getTransientRetryMinutes(env) {
+  return clampInt(env.TRANSIENT_RETRY_MINUTES, DEFAULT_TRANSIENT_RETRY_MINUTES, 5, 24 * 60);
+}
+
 function getSyncFolders(env) {
   const raw = typeof env.SYNC_FOLDERS === "string" ? env.SYNC_FOLDERS : "";
   const folders = raw
@@ -1619,6 +1699,36 @@ function clampInt(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.M
     return fallback;
   }
   return Math.min(max, Math.max(min, parsed));
+}
+
+function minutesSince(value, now = new Date()) {
+  const time = Date.parse(value || "");
+  if (Number.isNaN(time)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(0, (now.getTime() - time) / 60000);
+}
+
+function isTransientSyncError(error) {
+  const message = String(error || "").toLowerCase();
+  return [
+    "too many",
+    "429",
+    "rate limit",
+    "throttl",
+    "temporar",
+    "try again",
+    "timeout",
+    "timed out",
+    "network",
+    "socket",
+    "connection",
+    "server busy",
+    "service unavailable",
+    "503",
+    "504",
+    "imap response did not complete",
+  ].some((pattern) => message.includes(pattern));
 }
 
 async function mapWithConcurrency(items, concurrency, worker) {

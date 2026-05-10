@@ -443,6 +443,16 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         color: var(--danger);
       }
 
+      .status-pill.waiting {
+        background: rgba(200, 111, 61, 0.13);
+        color: var(--accent);
+      }
+
+      .status-pill.success {
+        background: rgba(6, 118, 71, 0.1);
+        color: var(--success);
+      }
+
       .message-preview,
       .muted,
       .account-meta,
@@ -511,6 +521,12 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       .notice.error {
         background: rgba(180, 35, 24, 0.1);
         color: var(--danger);
+      }
+
+      .sync-note {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
       }
 
       .login-shell {
@@ -636,8 +652,14 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           accountFormOpen: true,
           bulkFormOpen: false
         },
-        skipNextCapture: false
+        skipNextCapture: false,
+        autoSyncing: false,
+        lastAutoSyncAt: 0,
+        lastAutoRefreshAt: null,
+        autoSyncMessage: ""
       };
+
+      let autoRefreshTimer = null;
 
       async function api(path, options) {
         const response = await fetch(path, Object.assign({
@@ -654,6 +676,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           state.accounts = [];
           state.messages = [];
           state.detail = null;
+          stopAutoRefresh();
           render();
           throw new Error(data.error || "需要重新登录");
         }
@@ -729,6 +752,105 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           .sort();
       }
 
+      function isTransientSyncError(error) {
+        const message = String(error || "").toLowerCase();
+        return [
+          "too many",
+          "429",
+          "rate limit",
+          "throttl",
+          "temporar",
+          "try again",
+          "timeout",
+          "timed out",
+          "network",
+          "socket",
+          "connection",
+          "server busy",
+          "service unavailable",
+          "503",
+          "504",
+          "imap response did not complete"
+        ].some(function (pattern) {
+          return message.indexOf(pattern) !== -1;
+        });
+      }
+
+      function minutesSince(value) {
+        const time = Date.parse(value || "");
+        if (Number.isNaN(time)) return Infinity;
+        return Math.max(0, (Date.now() - time) / 60000);
+      }
+
+      function shouldRequestAutoSync(account) {
+        const status = account.last_sync_status || "idle";
+        if (status === "running" || status === "queued") return false;
+        if (!account.last_sync_at) return true;
+        if (status === "pending_retry" || (status === "error" && isTransientSyncError(account.last_sync_error))) {
+          return minutesSince(account.last_sync_at) >= 10;
+        }
+        if (status === "error") return false;
+        return minutesSince(account.last_sync_at) >= 30;
+      }
+
+      function syncStatusInfo(account) {
+        const rawStatus = account.last_sync_status || "idle";
+        const transientError = rawStatus === "error" && isTransientSyncError(account.last_sync_error);
+        const status = transientError ? "pending_retry" : rawStatus;
+        if (status === "success") return { className: "status-pill success", label: "正常", errorPrefix: "提示" };
+        if (status === "running") return { className: "status-pill waiting", label: "同步中", errorPrefix: "提示" };
+        if (status === "pending_retry") return { className: "status-pill waiting", label: "等待重试", errorPrefix: "原因" };
+        if (status === "error") return { className: "status-pill error", label: "error", errorPrefix: "错误" };
+        return { className: "status-pill", label: status, errorPrefix: "提示" };
+      }
+
+      function startAutoRefresh() {
+        if (autoRefreshTimer) return;
+        autoRefreshTimer = setInterval(refreshDashboardInBackground, 30000);
+      }
+
+      function stopAutoRefresh() {
+        if (!autoRefreshTimer) return;
+        clearInterval(autoRefreshTimer);
+        autoRefreshTimer = null;
+      }
+
+      async function refreshDashboardInBackground() {
+        if (!state.authenticated || state.busy) return;
+        try {
+          await refreshDashboard({ skipAutoSync: true });
+          state.lastAutoRefreshAt = new Date().toISOString();
+        } catch (error) {
+          console.warn("auto refresh failed", error);
+        }
+      }
+
+      async function maybeAutoSync(reason) {
+        if (!state.authenticated || state.busy || state.autoSyncing) return;
+        if (Date.now() - state.lastAutoSyncAt < 5 * 60 * 1000) return;
+        if (!state.accounts.some(shouldRequestAutoSync)) return;
+
+        state.autoSyncing = true;
+        state.lastAutoSyncAt = Date.now();
+        state.autoSyncMessage = "后台自动同步已启动，失败账号会按退避时间重试。";
+        render();
+
+        try {
+          const result = await api("/api/sync/auto", { method: "POST", body: "{}" });
+          state.autoSyncMessage = result.queued
+            ? "后台正在自动同步 " + result.queued + " 个需要更新的账号。"
+            : "自动刷新已开启，当前没有需要同步的账号。";
+          setTimeout(refreshDashboardInBackground, 5000);
+          setTimeout(refreshDashboardInBackground, 20000);
+          setTimeout(refreshDashboardInBackground, 60000);
+        } catch (error) {
+          state.autoSyncMessage = "自动同步启动失败: " + error.message;
+        } finally {
+          state.autoSyncing = false;
+          render();
+        }
+      }
+
       function captureUiState() {
         const accountForm = document.getElementById("account-form");
         if (accountForm) {
@@ -775,8 +897,10 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           state.authenticated = !!session.authenticated;
           state.checking = false;
           if (state.authenticated) {
+            startAutoRefresh();
             await refreshDashboard();
           } else {
+            stopAutoRefresh();
             render();
           }
         } catch (error) {
@@ -785,13 +909,16 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         }
       }
 
-      async function refreshDashboard() {
+      async function refreshDashboard(options) {
         const accounts = await api("/api/accounts", { method: "GET" });
         state.accounts = accounts;
         if (!state.filters.accountId && accounts.length) {
           state.filters.accountId = String(accounts[0].id);
         }
         await loadMessages();
+        if (!options || !options.skipAutoSync) {
+          maybeAutoSync("refresh");
+        }
       }
 
       async function loadMessages() {
@@ -854,6 +981,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           state.authenticated = true;
           state.notice = null;
           state.busy = false;
+          startAutoRefresh();
           await refreshDashboard();
         } catch (error) {
           state.busy = false;
@@ -873,6 +1001,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         state.messages = [];
         state.detail = null;
         state.selectedMessage = null;
+        stopAutoRefresh();
         render();
       }
 
@@ -1153,7 +1282,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const bulkFormOpen = state.ui.bulkFormOpen ? " open" : "";
         const accountItems = state.accounts.map(function (account) {
           const isActive = String(account.id) === String(state.filters.accountId);
-          const statusClass = account.last_sync_status === "error" ? "status-pill error" : "status-pill";
+          const statusInfo = syncStatusInfo(account);
           return ''
             + '<div class="account-item card ' + (isActive ? 'active' : '') + '">'
             + '  <div class="account-top">'
@@ -1162,10 +1291,10 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '      <div class="account-meta">Client ID: <span class="code">' + escapeHtml(shortText(account.client_id, 20)) + '</span></div>'
             + '      <div class="account-meta">分组: <span class="status-pill">' + escapeHtml(account.group_name || "默认分组") + '</span></div>'
             + '    </div>'
-            + '    <span class="' + statusClass + '">' + escapeHtml(account.last_sync_status || "idle") + '</span>'
+            + '    <span class="' + statusInfo.className + '">' + escapeHtml(statusInfo.label) + '</span>'
             + '  </div>'
             + '  <div class="account-meta">最近同步: ' + escapeHtml(formatDate(account.last_sync_at)) + '</div>'
-            + (account.last_sync_error ? '<div class="account-meta">错误: ' + escapeHtml(shortText(account.last_sync_error, 120)) + '</div>' : '')
+            + (account.last_sync_error ? '<div class="account-meta">' + statusInfo.errorPrefix + ': ' + escapeHtml(shortText(account.last_sync_error, 120)) + '</div>' : '')
             + '  <div class="account-actions">'
             + '    <button type="button" class="btn small secondary" data-select-account="' + escapeHtml(account.id) + '"' + disabled + '>查看归档</button>'
             + '    <button type="button" class="btn small primary" data-sync-account="' + escapeHtml(account.id) + '"' + disabled + '>同步</button>'
@@ -1250,6 +1379,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '      <div class="metric card"><span>当前结果</span><strong>' + escapeHtml(String(state.messages.length)) + '</strong></div>'
           + '      <div class="metric card"><span>匹配总数</span><strong>' + escapeHtml(String(state.stats.total || 0)) + '</strong></div>'
           + '    </div>'
+          + '    <div class="sync-note">' + escapeHtml(state.autoSyncMessage || "已开启后台自动刷新：每 30 秒刷新状态；临时失败会自动退避重试。") + '</div>'
           + (state.notice ? '<div class="notice ' + (state.notice.type === "error" ? 'error' : '') + '">' + escapeHtml(state.notice.message) + '</div>' : '')
           + '  </section>'
           + '  <section class="app-grid">'

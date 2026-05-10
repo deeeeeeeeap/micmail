@@ -4,15 +4,17 @@
   "main": "src/worker.js",
   "compatibility_date": "2026-04-01",
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["*/15 * * * *"]
   },
   "vars": {
     "MAIL_RETENTION_DAYS": "90",
     "SESSION_TTL_HOURS": "12",
     "SYNC_PAGE_SIZE": "50",
     "MAX_SYNC_PAGES": "40",
-    "SYNC_CONCURRENCY": "3",
-    "SYNC_FOLDERS": "inbox,junkemail"
+    "SYNC_CONCURRENCY": "1",
+    "SYNC_FOLDERS": "inbox,junkemail",
+    "AUTO_SYNC_STALE_MINUTES": "30",
+    "TRANSIENT_RETRY_MINUTES": "20"
   },
   "d1_databases": [
     {
