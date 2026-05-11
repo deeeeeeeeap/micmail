@@ -7,9 +7,14 @@ const DEFAULT_SYNC_PAGE_SIZE = 50;
 const DEFAULT_MAX_SYNC_PAGES = 40;
 const DEFAULT_SYNC_FOLDERS = ["inbox", "junkemail"];
 const DEFAULT_AUTO_SYNC_STALE_MINUTES = 30;
-const DEFAULT_TRANSIENT_RETRY_MINUTES = 20;
+const DEFAULT_TRANSIENT_RETRY_MINUTES = 10;
 const DEFAULT_QUEUED_STALE_MINUTES = 10;
 const DEFAULT_RUNNING_STALE_MINUTES = 60;
+const DEFAULT_IMAP_FETCH_BATCH_SIZE = 1;
+const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
+const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 30;
+const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 10;
+const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 
 let schemaPromise;
@@ -1189,12 +1194,18 @@ async function graphFetchArrayBuffer(url, accessToken) {
 }
 
 async function syncImapFolderMessages(env, account, accessToken, folder, cursorMap = {}) {
-  const client = await createImapClient("outlook.office365.com", 993);
+  const bodyPeekBytes = getImapBodyPeekBytes(env);
+  const fetchBatchSize = getImapFetchBatchSize(env);
+  const client = await createImapClient("outlook.office365.com", 993, {
+    totalTimeoutMs: getImapCommandTimeoutSeconds(env) * 1000,
+    idleTimeoutMs: getImapIdleTimeoutSeconds(env) * 1000,
+  });
   try {
     await client.readGreeting();
     await client.command(
       "AUTHENTICATE XOAUTH2 " + makeXoauth2Token(account.email, accessToken),
       "OK",
+      { label: "AUTHENTICATE XOAUTH2" },
     );
 
     const mailbox = await selectImapMailbox(client, folder);
@@ -1202,8 +1213,11 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
     const previousLastUid = clampInt(cursorMap[cursorKey], 0, 0);
     const searchCommand = previousLastUid > 0
       ? "UID SEARCH UID " + String(previousLastUid + 1) + ":*"
-      : "UID SEARCH ALL";
-    const searchResponse = await client.command(searchCommand, "OK");
+      : "UID SEARCH SINCE " + formatImapSearchDate(addDays(new Date(), -getRetentionDays(env)));
+    const searchResponse = await client.command(searchCommand, "OK", {
+      label: "UID SEARCH",
+      maxBytes: DEFAULT_IMAP_BASE_RESPONSE_BYTES * 2,
+    });
     const searchedUids = parseImapSearchUids(searchResponse)
       .filter((uid) => uid > previousLastUid);
     const uids = previousLastUid > 0 ? searchedUids : searchedUids.slice(-getSyncPageSize(env));
@@ -1214,11 +1228,14 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
       return { messageCount: 0, mailbox, lastUid };
     }
 
-    for (const chunk of chunkArray(uids, 10)) {
+    for (const chunk of chunkArray(uids, fetchBatchSize)) {
       const response = await client.command(
-        "UID FETCH " + chunk.join(",") + " (UID FLAGS INTERNALDATE BODY.PEEK[])",
+        "UID FETCH " + chunk.join(",") + " (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[]<0." + bodyPeekBytes + ">)",
         "OK",
-        20,
+        {
+          label: "UID FETCH",
+          maxBytes: getImapFetchMaxResponseBytes(bodyPeekBytes, chunk.length),
+        },
       );
       const rawMessages = extractImapLiteralBodies(response);
       for (const rawMessage of rawMessages) {
@@ -1235,7 +1252,7 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
   }
 }
 
-async function createImapClient(hostname, port) {
+async function createImapClient(hostname, port, readDefaults = {}) {
   const socket = connect(
     { hostname, port },
     { secureTransport: "on" },
@@ -1246,19 +1263,52 @@ async function createImapClient(hostname, port) {
   const textEncoder = new TextEncoder();
   let tagIndex = 1;
 
-  async function readUntil(pattern, maxChunks = 10) {
+  async function readUntil(pattern, options = {}) {
+    const label = options.label || "IMAP command";
+    const totalTimeoutMs = options.totalTimeoutMs || readDefaults.totalTimeoutMs || DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS * 1000;
+    const idleTimeoutMs = options.idleTimeoutMs || readDefaults.idleTimeoutMs || DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS * 1000;
+    const maxBytes = options.maxBytes || DEFAULT_IMAP_BASE_RESPONSE_BYTES;
+    const startedAt = Date.now();
+    let bytesRead = 0;
+    let chunksRead = 0;
     let text = "";
-    for (let i = 0; i < maxChunks; i += 1) {
-      const { value, done } = await reader.read();
+    while (Date.now() - startedAt < totalTimeoutMs) {
+      const remainingMs = totalTimeoutMs - (Date.now() - startedAt);
+      const { value, done } = await readChunkWithTimeout(
+        reader,
+        Math.max(1, Math.min(idleTimeoutMs, remainingMs)),
+        label,
+      );
       if (done) {
         break;
+      }
+      chunksRead += 1;
+      bytesRead += value.byteLength || value.length || 0;
+      if (bytesRead > maxBytes) {
+        throw new Error(
+          "IMAP response exceeded " +
+            maxBytes +
+            " bytes while reading " +
+            label +
+            ".",
+        );
       }
       text += decoder.decode(value, { stream: true });
       if (pattern.test(text)) {
         return text;
       }
     }
-    throw new Error("IMAP response did not complete.");
+    throw new Error(
+      "IMAP response did not complete for " +
+        label +
+        " after " +
+        (Date.now() - startedAt) +
+        "ms (" +
+        chunksRead +
+        " chunks, " +
+        bytesRead +
+        " bytes).",
+    );
   }
 
   async function writeLine(line) {
@@ -1267,14 +1317,15 @@ async function createImapClient(hostname, port) {
 
   return {
     async readGreeting() {
-      return await readUntil(/\* OK/i, 5);
+      return await readUntil(/\* OK/i, { label: "IMAP greeting" });
     },
-    async command(commandText, expected = "OK", maxChunks = 10) {
+    async command(commandText, expected = "OK", options = {}) {
       const tag = "A" + String(tagIndex++).padStart(4, "0");
+      const label = options.label || summarizeImapCommand(commandText);
       await writeLine(tag + " " + commandText);
       const response = await readUntil(
         new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"),
-        maxChunks,
+        { ...options, label },
       );
       const statusMatch = response.match(new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"));
       const status = statusMatch ? statusMatch[1].toUpperCase() : "";
@@ -1302,6 +1353,23 @@ async function createImapClient(hostname, port) {
       }
     },
   };
+}
+
+async function readChunkWithTimeout(reader, timeoutMs, label) {
+  let timeoutId;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error("IMAP read timed out for " + label + " after " + timeoutMs + "ms.")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function selectImapMailbox(client, folder) {
@@ -1521,12 +1589,25 @@ function chunkArray(items, size) {
   return chunks;
 }
 
+function formatImapSearchDate(date) {
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return date.getUTCDate() + "-" + months[date.getUTCMonth()] + "-" + date.getUTCFullYear();
+}
+
 function shaLikeId(value) {
   let hash = 0;
   for (let i = 0; i < value.length; i += 1) {
     hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
   }
   return "generated-" + hash.toString(16);
+}
+
+function summarizeImapCommand(commandText) {
+  const text = String(commandText || "");
+  if (/^AUTHENTICATE\s+XOAUTH2/i.test(text)) {
+    return "AUTHENTICATE XOAUTH2";
+  }
+  return text.replace(/\s+/g, " ").slice(0, 120);
 }
 
 function summarizeImapResponse(response) {
@@ -1754,6 +1835,26 @@ function getQueuedStaleMinutes(env) {
 
 function getRunningStaleMinutes(env) {
   return clampInt(env.RUNNING_STALE_MINUTES, DEFAULT_RUNNING_STALE_MINUTES, 15, 24 * 60);
+}
+
+function getImapFetchBatchSize(env) {
+  return clampInt(env.IMAP_FETCH_BATCH_SIZE, DEFAULT_IMAP_FETCH_BATCH_SIZE, 1, 10);
+}
+
+function getImapBodyPeekBytes(env) {
+  return clampInt(env.IMAP_BODY_PEEK_BYTES, DEFAULT_IMAP_BODY_PEEK_BYTES, 64 * 1024, 8 * 1024 * 1024);
+}
+
+function getImapCommandTimeoutSeconds(env) {
+  return clampInt(env.IMAP_COMMAND_TIMEOUT_SECONDS, DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS, 10, 120);
+}
+
+function getImapIdleTimeoutSeconds(env) {
+  return clampInt(env.IMAP_IDLE_TIMEOUT_SECONDS, DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS, 3, 60);
+}
+
+function getImapFetchMaxResponseBytes(bodyPeekBytes, batchSize) {
+  return DEFAULT_IMAP_BASE_RESPONSE_BYTES + bodyPeekBytes * Math.max(1, batchSize);
 }
 
 function getSyncFolders(env) {
