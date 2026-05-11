@@ -389,6 +389,62 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         box-shadow: inset 0 0 0 1px rgba(13, 110, 110, 0.22);
       }
 
+      .group-nav {
+        padding: 16px;
+      }
+
+      .group-nav-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      .group-nav-title {
+        font-weight: 700;
+      }
+
+      .group-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .group-item {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.72);
+        padding: 11px 12px;
+        color: var(--ink);
+        display: grid;
+        gap: 6px;
+        text-align: left;
+      }
+
+      .group-item.active {
+        border-color: rgba(13, 110, 110, 0.45);
+        background: var(--brand-soft);
+      }
+
+      .group-item-top,
+      .group-item-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .group-name {
+        font-weight: 700;
+        overflow-wrap: anywhere;
+      }
+
+      .group-item-meta {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
       .account-top,
       .message-top,
       .detail-meta,
@@ -743,13 +799,77 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       function accountGroups() {
         const seen = {};
         return state.accounts
-          .map(function (account) { return account.group_name || "默认分组"; })
+          .map(normalizeAccountGroup)
           .filter(function (group) {
             if (seen[group]) return false;
             seen[group] = true;
             return true;
           })
           .sort();
+      }
+
+      function normalizeAccountGroup(account) {
+        return account && account.group_name ? account.group_name : "默认分组";
+      }
+
+      function accountMatchesGroup(account, groupName) {
+        return !groupName || normalizeAccountGroup(account) === groupName;
+      }
+
+      function accountNeedsAttention(account) {
+        const status = account.last_sync_status || "idle";
+        return status === "pending_retry"
+          || status === "error"
+          || isTransientSyncError(account.last_sync_error);
+      }
+
+      function groupSummaries() {
+        const groups = accountGroups();
+        const summaries = groups.map(function (group) {
+          const accounts = state.accounts.filter(function (account) {
+            return accountMatchesGroup(account, group);
+          });
+          return {
+            name: group,
+            accountCount: accounts.length,
+            attentionCount: accounts.filter(accountNeedsAttention).length
+          };
+        });
+        const totalAttention = state.accounts.filter(accountNeedsAttention).length;
+        return [{
+          name: "",
+          label: "全部分组",
+          accountCount: state.accounts.length,
+          attentionCount: totalAttention
+        }].concat(summaries.map(function (summary) {
+          return Object.assign({ label: summary.name }, summary);
+        }));
+      }
+
+      function visibleAccounts() {
+        return state.accounts.filter(function (account) {
+          return accountMatchesGroup(account, state.filters.group);
+        });
+      }
+
+      function filterAccountOptions() {
+        return visibleAccounts();
+      }
+
+      function sanitizeFilters() {
+        const selectedAccount = activeAccount();
+        if (state.filters.accountId && !selectedAccount) {
+          state.filters.accountId = "";
+        }
+
+        const groups = accountGroups();
+        if (state.filters.group && groups.indexOf(state.filters.group) === -1) {
+          state.filters.group = "";
+        }
+
+        if (selectedAccount) {
+          state.filters.group = normalizeAccountGroup(selectedAccount);
+        }
       }
 
       function isTransientSyncError(error) {
@@ -913,9 +1033,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
       async function refreshDashboard(options) {
         const accounts = await api("/api/accounts", { method: "GET" });
         state.accounts = accounts;
-        if (!state.filters.accountId && accounts.length) {
-          state.filters.accountId = String(accounts[0].id);
-        }
+        sanitizeFilters();
         await loadMessages();
         if (!options || !options.skipAutoSync) {
           maybeAutoSync("refresh");
@@ -1234,6 +1352,14 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         state.filters.folder = document.getElementById("filter-folder").value;
         state.filters.group = document.getElementById("filter-group").value;
         state.filters.keyword = document.getElementById("filter-keyword").value.trim();
+        sanitizeFilters();
+        await loadMessages();
+      }
+
+      async function handleSelectGroup(groupName) {
+        if (state.busy) return;
+        state.filters.group = groupName || "";
+        state.filters.accountId = "";
         await loadMessages();
       }
 
@@ -1285,7 +1411,9 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const accountDraft = state.drafts.account;
         const accountFormOpen = state.ui.accountFormOpen ? " open" : "";
         const bulkFormOpen = state.ui.bulkFormOpen ? " open" : "";
-        const accountItems = state.accounts.map(function (account) {
+        const listedAccounts = visibleAccounts();
+        const filterAccounts = filterAccountOptions();
+        const accountItems = listedAccounts.map(function (account) {
           const isActive = String(account.id) === String(state.filters.accountId);
           const statusInfo = syncStatusInfo(account);
           return ''
@@ -1294,7 +1422,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '    <div>'
             + '      <div class="account-email">' + escapeHtml(account.email) + '</div>'
             + '      <div class="account-meta">Client ID: <span class="code">' + escapeHtml(shortText(account.client_id, 20)) + '</span></div>'
-            + '      <div class="account-meta">分组: <span class="status-pill">' + escapeHtml(account.group_name || "默认分组") + '</span></div>'
+            + '      <div class="account-meta">分组: <span class="status-pill">' + escapeHtml(normalizeAccountGroup(account)) + '</span></div>'
             + '    </div>'
             + '    <span class="' + statusInfo.className + '">' + escapeHtml(statusInfo.label) + '</span>'
             + '  </div>'
@@ -1307,6 +1435,21 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
             + '    <button type="button" class="btn small warn" data-delete-account="' + escapeHtml(account.id) + '"' + disabled + '>删除</button>'
             + '  </div>'
             + '</div>';
+        }).join("");
+
+        const groupNavItems = groupSummaries().map(function (group) {
+          const isActive = state.filters.group === group.name;
+          const attentionHtml = group.attentionCount
+            ? '<span class="status-pill waiting">' + escapeHtml(String(group.attentionCount)) + ' 个需关注</span>'
+            : '<span class="status-pill success">正常</span>';
+          return ''
+            + '<button type="button" class="group-item ' + (isActive ? 'active' : '') + '" data-select-group="' + escapeHtml(group.name) + '"' + disabled + '>'
+            + '  <span class="group-item-top">'
+            + '    <span class="group-name">' + escapeHtml(group.label) + '</span>'
+            + '    ' + attentionHtml
+            + '  </span>'
+            + '  <span class="group-item-meta"><span>' + escapeHtml(String(group.accountCount)) + ' 个账号</span><span>' + (isActive ? '当前查询' : '点击查看') + '</span></span>'
+            + '</button>';
         }).join("");
 
         const messageItems = state.messages.map(function (message) {
@@ -1411,7 +1554,11 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '          <button class="btn primary" type="submit"' + disabled + '>' + (state.busy ? '处理中...' : '批量导入账号') + '</button>'
           + '          </form>'
           + '        </details>'
-          + '        <div class="account-list">' + (accountItems || '<div class="empty">还没有已保存的邮箱账号。</div>') + '</div>'
+          + '        <div class="group-nav card">'
+          + '          <div class="group-nav-head"><div><div class="group-nav-title">分组导航</div><div class="muted">点击分组后查询该组全部账号邮件。</div></div></div>'
+          + '          <div class="group-list">' + groupNavItems + '</div>'
+          + '        </div>'
+          + '        <div class="account-list">' + (accountItems || '<div class="empty">' + (state.filters.group ? '当前分组没有账号。' : '还没有已保存的邮箱账号。') + '</div>') + '</div>'
           + '      </div>'
           + '    </div>'
           + '    <div class="panel">'
@@ -1419,7 +1566,7 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
           + '      <div class="panel-body stack">'
           + '        <form id="filter-form" class="stack card" style="padding:14px">'
           + '          <div class="form-row">'
-          + '            <label style="flex:1">账号<select id="filter-account"' + disabled + '><option value="">全部</option>' + state.accounts.map(function (account) { return '<option value="' + escapeHtml(account.id) + '"' + (String(account.id) === String(state.filters.accountId) ? ' selected' : '') + '>' + escapeHtml(account.email) + '</option>'; }).join("") + '</select></label>'
+          + '            <label style="flex:1">账号<select id="filter-account"' + disabled + '><option value="">' + (state.filters.group ? '全组账号' : '全部') + '</option>' + filterAccounts.map(function (account) { return '<option value="' + escapeHtml(account.id) + '"' + (String(account.id) === String(state.filters.accountId) ? ' selected' : '') + '>' + escapeHtml(account.email) + '</option>'; }).join("") + '</select></label>'
           + '            <label style="width:150px">文件夹<select id="filter-folder"' + disabled + '><option value="">全部</option><option value="inbox"' + (state.filters.folder === "inbox" ? ' selected' : '') + '>inbox</option><option value="junkemail"' + (state.filters.folder === "junkemail" ? ' selected' : '') + '>junkemail</option></select></label>'
           + '          </div>'
           + '          <label>分组<select id="filter-group"' + disabled + '><option value="">全部分组</option>' + groups.map(function (group) { return '<option value="' + escapeHtml(group) + '"' + (state.filters.group === group ? ' selected' : '') + '>' + escapeHtml(group) + '</option>'; }).join("") + '</select></label>'
@@ -1471,15 +1618,31 @@ export const APP_HTML = String.raw`<!DOCTYPE html>
         const filterForm = document.getElementById("filter-form");
         if (filterForm) filterForm.onsubmit = handleFilter;
 
+        const filterGroup = document.getElementById("filter-group");
+        if (filterGroup) {
+          filterGroup.onchange = function () {
+            const accountSelect = document.getElementById("filter-account");
+            if (accountSelect) accountSelect.value = "";
+          };
+        }
+
         const syncAllBtn = document.getElementById("sync-all-btn");
         if (syncAllBtn) syncAllBtn.onclick = handleSyncAll;
 
         const logoutBtn = document.getElementById("logout-btn");
         if (logoutBtn) logoutBtn.onclick = handleLogout;
 
+        Array.from(document.querySelectorAll("[data-select-group]")).forEach(function (button) {
+          button.onclick = async function () {
+            await handleSelectGroup(button.getAttribute("data-select-group") || "");
+          };
+        });
+
         Array.from(document.querySelectorAll("[data-select-account]")).forEach(function (button) {
           button.onclick = async function () {
             state.filters.accountId = String(button.getAttribute("data-select-account"));
+            const account = activeAccount();
+            state.filters.group = account ? normalizeAccountGroup(account) : "";
             await loadMessages();
           };
         });
