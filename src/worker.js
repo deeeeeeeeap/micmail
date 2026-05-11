@@ -10,11 +10,21 @@ const DEFAULT_AUTO_SYNC_STALE_MINUTES = 30;
 const DEFAULT_TRANSIENT_RETRY_MINUTES = 10;
 const DEFAULT_QUEUED_STALE_MINUTES = 10;
 const DEFAULT_RUNNING_STALE_MINUTES = 60;
+const DEFAULT_MAX_SYNC_ACCOUNTS_PER_RUN = 8;
+const DEFAULT_SYNC_RUN_RETENTION_DAYS = 14;
 const DEFAULT_IMAP_FETCH_BATCH_SIZE = 1;
 const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
 const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
 const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
+const PERFORMANCE_INDEX_SQL = [
+  "CREATE INDEX IF NOT EXISTS idx_mail_accounts_group_name ON mail_accounts(group_name)",
+  "CREATE INDEX IF NOT EXISTS idx_mail_accounts_status_sync ON mail_accounts(status, last_sync_status, last_sync_at, updated_at)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_account_received ON messages(account_id, received_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_folder_received ON messages(folder, received_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_account_folder_received ON messages(account_id, folder, received_at DESC, id DESC)",
+  "CREATE INDEX IF NOT EXISTS idx_sync_runs_account_started ON sync_runs(account_id, started_at DESC)",
+];
 const encoder = new TextEncoder();
 
 let schemaPromise;
@@ -126,7 +136,7 @@ async function handleRequest(request, env, ctx) {
 
   const accountSyncMatch = path.match(/^\/api\/accounts\/(\d+)\/sync$/);
   if (accountSyncMatch && request.method === "POST") {
-    return await syncSingleAccountRoute(env, Number(accountSyncMatch[1]));
+    return await syncSingleAccountRoute(env, Number(accountSyncMatch[1]), ctx);
   }
 
   const messageMatch = path.match(/^\/api\/messages\/(\d+)$/);
@@ -347,7 +357,7 @@ async function deleteAccountRoute(env, accountId) {
   });
 }
 
-async function syncSingleAccountRoute(env, accountId) {
+async function syncSingleAccountRoute(env, accountId, ctx) {
   const account = await getAccountById(env, accountId, true);
   if (!account) {
     throw new HttpError(404, "Account not found.");
@@ -365,27 +375,66 @@ async function syncSingleAccountRoute(env, accountId) {
     }, 202);
   }
 
-  const result = await syncAccount(env, account);
+  const claimed = await claimSyncAccounts(env, [account], 1);
+  if (!claimed.length) {
+    return jsonResponse({
+      success: true,
+      data: {
+        accountId: account.id,
+        email: account.email,
+        status: "queued",
+        message: "Account sync is already queued or running.",
+      },
+    }, 202);
+  }
+
+  const task = syncAccount(env, claimed[0]);
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(task);
+    return jsonResponse({
+      success: true,
+      data: {
+        accountId: account.id,
+        email: account.email,
+        status: "queued",
+        message: "Account sync is running in the background.",
+      },
+    }, 202);
+  }
+
+  const result = await task;
   return jsonResponse({ success: true, data: result });
 }
 
 async function syncAllAccountsRoute(env, ctx) {
   const urlStartedAt = new Date().toISOString();
-  const task = syncAllAccounts(env);
+  const accounts = await claimManualSyncAccounts(env);
+  const task = syncAccounts(env, accounts, getSyncConcurrency(env));
   if (ctx?.waitUntil) {
     ctx.waitUntil(task);
     return jsonResponse({
       success: true,
       data: {
         status: "started",
+        queued: accounts.length,
+        batchLimit: getMaxSyncAccountsPerRun(env),
         startedAt: urlStartedAt,
-        message: "Full sync is running in the background.",
+        message: accounts.length
+          ? "Sync batch is running in the background."
+          : "No account is available for sync right now.",
       },
     }, 202);
   }
 
   const results = await task;
-  return jsonResponse({ success: true, data: results });
+  return jsonResponse({
+    success: true,
+    data: {
+      queued: accounts.length,
+      batchLimit: getMaxSyncAccountsPerRun(env),
+      results,
+    },
+  });
 }
 
 async function syncAutoAccountsRoute(env, ctx) {
@@ -484,7 +533,7 @@ async function listMessagesRoute(url, env) {
      FROM messages m
      JOIN mail_accounts a ON a.id = m.account_id
      ${whereClause}
-     ORDER BY datetime(m.received_at) DESC, m.id DESC
+     ORDER BY m.received_at DESC, m.id DESC
      LIMIT ? OFFSET ?`,
   )
     .bind(...params, pageSize, offset)
@@ -600,12 +649,10 @@ async function runScheduledMaintenance(env, cron) {
   logInfo("scheduled_start", { cron });
   await cleanupExpiredSessions(env);
   await cleanupExpiredArchive(env);
+  await cleanupStaleSyncRuns(env);
+  await cleanupOldSyncRuns(env);
   await syncAutoAccounts(env);
   logInfo("scheduled_complete", { cron });
-}
-
-async function syncAllAccounts(env) {
-  return await syncAccounts(env, await getManualSyncAccounts(env), getSyncConcurrency(env));
 }
 
 async function syncAutoAccounts(env) {
@@ -617,7 +664,10 @@ async function getActiveAccounts(env) {
     `SELECT *
      FROM mail_accounts
      WHERE status = 'active'
-     ORDER BY id ASC`,
+     ORDER BY
+       CASE WHEN last_sync_at IS NULL THEN 0 ELSE 1 END,
+       last_sync_at ASC,
+       id ASC`,
   ).all();
   return accounts.results ?? [];
 }
@@ -628,17 +678,34 @@ async function getManualSyncAccounts(env) {
   return accounts.filter((account) => !isFreshSyncInProgress(env, account, now));
 }
 
+async function claimManualSyncAccounts(env) {
+  const maxAccounts = getMaxSyncAccountsPerRun(env);
+  const candidates = await getManualSyncAccounts(env);
+  return await claimSyncAccounts(env, candidates, maxAccounts);
+}
+
 async function claimAutoSyncAccounts(env) {
+  const now = new Date();
+  const maxAccounts = getMaxSyncAccountsPerRun(env);
+  const candidates = await getActiveAccounts(env);
+
+  return await claimSyncAccounts(
+    env,
+    candidates.filter((account) => shouldAutoSyncAccount(env, account, now)),
+    maxAccounts,
+  );
+}
+
+async function claimSyncAccounts(env, candidates, maxAccounts) {
   const now = new Date();
   const nowIso = now.toISOString();
   const queuedStaleBefore = minutesAgoIso(now, getQueuedStaleMinutes(env));
   const runningStaleBefore = minutesAgoIso(now, getRunningStaleMinutes(env));
-  const candidates = await getActiveAccounts(env);
   const claimed = [];
 
   for (const account of candidates) {
-    if (!shouldAutoSyncAccount(env, account, now)) {
-      continue;
+    if (claimed.length >= maxAccounts) {
+      break;
     }
 
     const result = await env.DB.prepare(
@@ -1083,6 +1150,29 @@ async function cleanupExpiredArchive(env) {
   for (const row of expiredMessages.results ?? []) {
     await deleteMessageArchive(env, row.id);
   }
+}
+
+async function cleanupStaleSyncRuns(env) {
+  const staleBefore = minutesAgoIso(new Date(), getRunningStaleMinutes(env));
+  await env.DB.prepare(
+    `UPDATE sync_runs
+     SET status = 'error',
+         finished_at = ?,
+         error_text = 'Sync run marked stale after timeout.'
+     WHERE status = 'running'
+       AND started_at <= ?
+       AND finished_at IS NULL`,
+  )
+    .bind(new Date().toISOString(), staleBefore)
+    .run();
+}
+
+async function cleanupOldSyncRuns(env) {
+  await env.DB.prepare(
+    "DELETE FROM sync_runs WHERE started_at <= ?",
+  )
+    .bind(addDays(new Date(), -getSyncRunRetentionDays(env)).toISOString())
+    .run();
 }
 
 async function verifyMicrosoftAccount(env, clientId, refreshToken) {
@@ -1742,6 +1832,7 @@ async function verifySchema(env) {
   }
 
   await ensureMailAccountColumns(env);
+  await ensurePerformanceIndexes(env);
 }
 
 async function ensureMailAccountColumns(env) {
@@ -1751,6 +1842,12 @@ async function ensureMailAccountColumns(env) {
     await env.DB.prepare(
       "ALTER TABLE mail_accounts ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认分组'",
     ).run();
+  }
+}
+
+async function ensurePerformanceIndexes(env) {
+  for (const sql of PERFORMANCE_INDEX_SQL) {
+    await env.DB.prepare(sql).run();
   }
 }
 
@@ -1841,6 +1938,14 @@ function getQueuedStaleMinutes(env) {
 
 function getRunningStaleMinutes(env) {
   return clampInt(env.RUNNING_STALE_MINUTES, DEFAULT_RUNNING_STALE_MINUTES, 15, 24 * 60);
+}
+
+function getMaxSyncAccountsPerRun(env) {
+  return clampInt(env.MAX_SYNC_ACCOUNTS_PER_RUN, DEFAULT_MAX_SYNC_ACCOUNTS_PER_RUN, 1, 25);
+}
+
+function getSyncRunRetentionDays(env) {
+  return clampInt(env.SYNC_RUN_RETENTION_DAYS, DEFAULT_SYNC_RUN_RETENTION_DAYS, 1, 365);
 }
 
 function getImapFetchBatchSize(env) {
