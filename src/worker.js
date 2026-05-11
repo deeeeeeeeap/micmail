@@ -12,8 +12,8 @@ const DEFAULT_QUEUED_STALE_MINUTES = 10;
 const DEFAULT_RUNNING_STALE_MINUTES = 60;
 const DEFAULT_IMAP_FETCH_BATCH_SIZE = 1;
 const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
-const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 30;
-const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 10;
+const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
+const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
 const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 
@@ -727,6 +727,7 @@ async function syncAccount(env, account) {
   let messageCount = 0;
   let attachmentCount = 0;
   const cursorMap = parseJsonObject(account.delta_links_json);
+  let graphSyncError = null;
 
   try {
     const refreshToken = await decryptText(
@@ -749,11 +750,12 @@ async function syncAccount(env, account) {
         attachmentCount += syncResult.attachmentCount;
       }
     } catch (graphError) {
+      graphSyncError = summarizeUpstreamError(graphError);
       syncMode = "imap";
       logInfo("graph_sync_failed_try_imap", {
         accountId: account.id,
         email: account.email,
-        error: summarizeUpstreamError(graphError),
+        error: graphSyncError,
       });
 
       const accessToken = await refreshImapAccessToken(env, account.client_id, refreshToken);
@@ -801,7 +803,7 @@ async function syncAccount(env, account) {
     };
   } catch (error) {
     const finishedAt = new Date().toISOString();
-    const syncError = summarizeUpstreamError(error);
+    const syncError = summarizeSyncFailure(error, graphSyncError);
     const failureStatus = isTransientSyncError(syncError) ? "pending_retry" : "error";
     await env.DB.prepare(
       `UPDATE mail_accounts
@@ -1127,9 +1129,9 @@ async function refreshAccessToken(env, clientId, refreshToken, scope = null) {
 
 async function refreshImapAccessToken(env, clientId, refreshToken) {
   const attempts = [
-    null,
     "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
     "https://outlook.office.com/.default offline_access",
+    null,
   ];
   const errors = [];
 
@@ -1205,7 +1207,11 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
     await client.command(
       "AUTHENTICATE XOAUTH2 " + makeXoauth2Token(account.email, accessToken),
       "OK",
-      { label: "AUTHENTICATE XOAUTH2" },
+      {
+        label: "AUTHENTICATE XOAUTH2",
+        totalTimeoutMs: Math.max(getImapCommandTimeoutSeconds(env) * 1000, 60000),
+        idleTimeoutMs: Math.max(getImapIdleTimeoutSeconds(env) * 1000, 30000),
+      },
     );
 
     const mailbox = await selectImapMailbox(client, folder);
@@ -2066,6 +2072,14 @@ function maskToken(token) {
 function summarizeUpstreamError(error) {
   const message = error && error.message ? String(error.message) : String(error);
   return message.replace(/\s+/g, " ").trim().slice(0, 600);
+}
+
+function summarizeSyncFailure(error, graphError = null) {
+  const imapError = summarizeUpstreamError(error);
+  if (!graphError) {
+    return imapError;
+  }
+  return ("Graph failed: " + graphError + " | IMAP failed: " + imapError).slice(0, 600);
 }
 
 function logInfo(event, detail) {
