@@ -20,6 +20,7 @@ const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
 const PERFORMANCE_INDEX_SQL = [
   "CREATE INDEX IF NOT EXISTS idx_mail_accounts_group_name ON mail_accounts(group_name)",
   "CREATE INDEX IF NOT EXISTS idx_mail_accounts_status_sync ON mail_accounts(status, last_sync_status, last_sync_at, updated_at)",
+  "CREATE INDEX IF NOT EXISTS idx_messages_received_id ON messages(received_at DESC, id DESC)",
   "CREATE INDEX IF NOT EXISTS idx_messages_account_received ON messages(account_id, received_at DESC, id DESC)",
   "CREATE INDEX IF NOT EXISTS idx_messages_folder_received ON messages(folder, received_at DESC, id DESC)",
   "CREATE INDEX IF NOT EXISTS idx_messages_account_folder_received ON messages(account_id, folder, received_at DESC, id DESC)",

@@ -64,6 +64,9 @@ ON messages(folder);
 CREATE INDEX IF NOT EXISTS idx_messages_received_at
 ON messages(received_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_messages_received_id
+ON messages(received_at DESC, id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_messages_account_received
 ON messages(account_id, received_at DESC, id DESC);
 
