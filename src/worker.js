@@ -32,6 +32,7 @@ const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
 const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
 const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
+const encoder = new TextEncoder();
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -179,7 +180,7 @@ async function loginRoute(request, env) {
     throw new HttpError(500, "ADMIN_PASSWORD is not configured.");
   }
 
-  if (password !== env.ADMIN_PASSWORD) {
+  if (!(await constantTimeStringEquals(password, env.ADMIN_PASSWORD))) {
     throw new HttpError(401, "Invalid password.");
   }
 
@@ -277,7 +278,7 @@ function buildGroupSummaries(accounts) {
   return [
     {
       name: "",
-      label: "鍏ㄩ儴鍒嗙粍",
+      label: "全部分组",
       accountCount: accounts.length,
       attentionCount: totalAttention,
     },
@@ -2051,7 +2052,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
 
 function normalizeGroupName(value) {
   const input = typeof value === "string" ? value.trim() : "";
-  return input || "榛樿鍒嗙粍";
+  return input || "默认分组";
 }
 
 function addHours(date, hours) {
@@ -2097,6 +2098,23 @@ async function sha256Hex(text) {
   return [...new Uint8Array(hash)]
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("");
+}
+
+async function constantTimeStringEquals(actual, expected) {
+  const [actualHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(actual)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  const actualBytes = new Uint8Array(actualHash);
+  const expectedBytes = new Uint8Array(expectedHash);
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(actualBytes, expectedBytes);
+  }
+  let diff = actualBytes.length ^ expectedBytes.length;
+  for (let index = 0; index < actualBytes.length; index += 1) {
+    diff |= actualBytes[index] ^ expectedBytes[index];
+  }
+  return diff === 0;
 }
 
 async function getSessionHash(token, env) {
