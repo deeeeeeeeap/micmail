@@ -62,6 +62,7 @@ async function handleRequest(request, env, ctx) {
       headers: {
         "content-type": "text/html; charset=UTF-8",
         "cache-control": "no-store",
+        ...securityHeaders(),
       },
     });
   }
@@ -108,6 +109,10 @@ async function handleRequest(request, env, ctx) {
     return await listAccountsRoute(env);
   }
 
+  if (path === "/api/dashboard" && request.method === "GET") {
+    return await dashboardRoute(url, env);
+  }
+
   if (path === "/api/accounts" && request.method === "POST") {
     return await createAccountRoute(request, env);
   }
@@ -118,6 +123,10 @@ async function handleRequest(request, env, ctx) {
 
   if (path === "/api/sync/auto" && request.method === "POST") {
     return await syncAutoAccountsRoute(env, ctx);
+  }
+
+  if (path === "/api/sync/runs" && request.method === "GET") {
+    return await listSyncRunsRoute(url, env);
   }
 
   if (path === "/api/messages" && request.method === "GET") {
@@ -241,6 +250,13 @@ async function sessionRoute(request, env) {
 }
 
 async function listAccountsRoute(env) {
+  return jsonResponse({
+    success: true,
+    data: await listAccountsData(env),
+  });
+}
+
+async function listAccountsData(env) {
   const result = await env.DB.prepare(
     `SELECT id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error,
             created_at, updated_at
@@ -248,7 +264,36 @@ async function listAccountsRoute(env) {
      ORDER BY updated_at DESC, id DESC`,
   ).all();
 
-  return jsonResponse({ success: true, data: result.results ?? [] });
+  return result.results ?? [];
+}
+
+function buildGroupSummaries(accounts) {
+  const map = new Map();
+  for (const account of accounts) {
+    const group = normalizeGroupName(account.group_name);
+    const item = map.get(group) || { name: group, accountCount: 0, attentionCount: 0 };
+    item.accountCount += 1;
+    if (accountNeedsAttention(account)) {
+      item.attentionCount += 1;
+    }
+    map.set(group, item);
+  }
+  const groups = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const totalAttention = accounts.filter(accountNeedsAttention).length;
+  return [
+    {
+      name: "",
+      label: "全部分组",
+      accountCount: accounts.length,
+      attentionCount: totalAttention,
+    },
+    ...groups.map((item) => ({ ...item, label: item.name })),
+  ];
+}
+
+function accountNeedsAttention(account) {
+  const status = account.last_sync_status || "idle";
+  return status === "pending_retry" || status === "error" || isTransientSyncError(account.last_sync_error);
 }
 
 async function createAccountRoute(request, env) {
@@ -463,6 +508,32 @@ async function syncAutoAccountsRoute(env, ctx) {
 }
 
 async function listMessagesRoute(url, env) {
+  return jsonResponse({
+    success: true,
+    data: await listMessagesData(url, env),
+  });
+}
+
+async function dashboardRoute(url, env) {
+  const [accounts, messages, syncSummary] = await Promise.all([
+    listAccountsData(env),
+    listMessagesData(url, env),
+    getSyncSummary(env),
+  ]);
+
+  return jsonResponse({
+    success: true,
+    data: {
+      accounts,
+      groups: buildGroupSummaries(accounts),
+      messages,
+      sync: syncSummary,
+      serverTime: new Date().toISOString(),
+    },
+  });
+}
+
+async function listMessagesData(url, env) {
   const page = clampInt(url.searchParams.get("page"), 1, 1);
   const pageSize = clampInt(url.searchParams.get("pageSize"), 25, 1, 100);
   const offset = (page - 1) * pageSize;
@@ -540,15 +611,73 @@ async function listMessagesRoute(url, env) {
     .bind(...params, pageSize, offset)
     .all();
 
+  return {
+    page,
+    pageSize,
+    total: totalRow?.total ?? 0,
+    items: rows.results ?? [],
+  };
+}
+
+async function listSyncRunsRoute(url, env) {
+  const limit = clampInt(url.searchParams.get("limit"), 20, 1, 100);
+  const accountId = url.searchParams.get("accountId");
+  const filters = [];
+  const params = [];
+
+  if (accountId) {
+    filters.push("r.account_id = ?");
+    params.push(Number(accountId));
+  }
+
+  const whereClause = filters.length ? "WHERE " + filters.join(" AND ") : "";
+  const rows = await env.DB.prepare(
+    `SELECT
+       r.id,
+       r.account_id,
+       a.email AS account_email,
+       r.status,
+       r.folder_scope,
+       r.started_at,
+       r.finished_at,
+       r.message_count,
+       r.attachment_count,
+       r.error_text
+     FROM sync_runs r
+     LEFT JOIN mail_accounts a ON a.id = r.account_id
+     ${whereClause}
+     ORDER BY r.started_at DESC, r.id DESC
+     LIMIT ?`,
+  )
+    .bind(...params, limit)
+    .all();
+
   return jsonResponse({
     success: true,
     data: {
-      page,
-      pageSize,
-      total: totalRow?.total ?? 0,
+      limit,
       items: rows.results ?? [],
     },
   });
+}
+
+async function getSyncSummary(env) {
+  const row = await env.DB.prepare(
+    `SELECT
+       SUM(CASE WHEN last_sync_status = 'success' THEN 1 ELSE 0 END) AS success_count,
+       SUM(CASE WHEN last_sync_status IN ('queued', 'running') THEN 1 ELSE 0 END) AS active_count,
+       SUM(CASE WHEN last_sync_status IN ('pending_retry', 'error') THEN 1 ELSE 0 END) AS attention_count,
+       MAX(last_sync_at) AS latest_sync_at
+     FROM mail_accounts
+     WHERE status = 'active'`,
+  ).first();
+
+  return {
+    successCount: Number(row?.success_count || 0),
+    activeCount: Number(row?.active_count || 0),
+    attentionCount: Number(row?.attention_count || 0),
+    latestSyncAt: row?.latest_sync_at || null,
+  };
 }
 
 async function getMessageRoute(env, messageId) {
@@ -1858,6 +1987,7 @@ function jsonResponse(payload, status = 200, extraHeaders = {}) {
     headers: {
       "content-type": "application/json; charset=UTF-8",
       "cache-control": "no-store",
+      ...securityHeaders(),
       ...corsHeaders(),
       ...extraHeaders,
     },
@@ -1877,9 +2007,27 @@ function handleError(error) {
 
 function corsHeaders() {
   return {
-    "access-control-allow-origin": "*",
     "access-control-allow-headers": "content-type",
     "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
+  };
+}
+
+function securityHeaders() {
+  return {
+    "Content-Security-Policy": [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "connect-src 'self'",
+      "form-action 'self'",
+      "frame-src 'self'",
+      "img-src 'self' data:",
+      "object-src 'none'",
+      "script-src 'self' 'unsafe-inline'",
+      "style-src 'self' 'unsafe-inline'",
+    ].join("; "),
+    "Referrer-Policy": "same-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
   };
 }
 

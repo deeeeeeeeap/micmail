@@ -100,12 +100,15 @@ Copy-Item .dev.vars.example .dev.vars
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
 - `GET /api/auth/session`
+- `GET /api/dashboard`
 - `GET /api/accounts`
 - `POST /api/accounts`
 - `PATCH /api/accounts/:id`
 - `DELETE /api/accounts/:id`
 - `POST /api/accounts/:id/sync`
 - `POST /api/sync/run`
+- `POST /api/sync/auto`
+- `GET /api/sync/runs`
 - `GET /api/messages`
 - `GET /api/messages/:id`
 - `POST /api/messages/:id/read`
@@ -226,12 +229,15 @@ Then fill the values.
 - `POST /api/auth/login`
 - `POST /api/auth/logout`
 - `GET /api/auth/session`
+- `GET /api/dashboard`
 - `GET /api/accounts`
 - `POST /api/accounts`
 - `PATCH /api/accounts/:id`
 - `DELETE /api/accounts/:id`
 - `POST /api/accounts/:id/sync`
 - `POST /api/sync/run`
+- `POST /api/sync/auto`
+- `GET /api/sync/runs`
 - `GET /api/messages`
 - `GET /api/messages/:id`
 - `POST /api/messages/:id/read`
@@ -241,6 +247,16 @@ Then fill the values.
 ### Retention
 
 Default retention is 90 days, controlled by `MAIL_RETENTION_DAYS`. Expired messages and their R2 objects are removed during scheduled maintenance.
+
+### Frontend structure
+
+The admin UI is still Worker-only and does not require a frontend build step.
+
+- `src/ui.js` assembles the HTML response.
+- `src/ui/styles.js` contains the Apple-inspired dashboard CSS.
+- `src/ui/app.js` contains the zero-build browser app logic.
+
+The dashboard prefers `GET /api/dashboard` for initial data loading and keeps the older API routes available for targeted actions.
 
 ### Notes
 

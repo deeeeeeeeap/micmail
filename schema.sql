@@ -26,6 +26,12 @@ CREATE TABLE IF NOT EXISTS mail_accounts (
 CREATE INDEX IF NOT EXISTS idx_mail_accounts_status
 ON mail_accounts(status);
 
+CREATE INDEX IF NOT EXISTS idx_mail_accounts_group_name
+ON mail_accounts(group_name);
+
+CREATE INDEX IF NOT EXISTS idx_mail_accounts_status_sync
+ON mail_accounts(status, last_sync_status, last_sync_at, updated_at);
+
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id INTEGER NOT NULL,
@@ -56,6 +62,18 @@ ON messages(folder);
 
 CREATE INDEX IF NOT EXISTS idx_messages_received_at
 ON messages(received_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_received_id
+ON messages(received_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_account_received
+ON messages(account_id, received_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_folder_received
+ON messages(folder, received_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_account_folder_received
+ON messages(account_id, folder, received_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_expires_at
 ON messages(expires_at);
@@ -94,3 +112,6 @@ ON sync_runs(account_id);
 
 CREATE INDEX IF NOT EXISTS idx_sync_runs_started_at
 ON sync_runs(started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sync_runs_account_started
+ON sync_runs(account_id, started_at DESC);
