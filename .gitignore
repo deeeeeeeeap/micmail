@@ -7,5 +7,7 @@ yarn-error.log*
 .dev.vars
 .wrangler/
 dist/
+output/
+p2a-session/
 .DS_Store
 Thumbs.db
