@@ -9,6 +9,11 @@ import {
   securityHeaders,
 } from "./lib/http.js";
 import { ensureSchema } from "./lib/schema.js";
+import {
+  base64ToUint8,
+  decryptText as decryptSecretText,
+  encryptText as encryptSecretText,
+} from "./lib/crypto.js";
 import { connect } from "cloudflare:sockets";
 const SESSION_COOKIE = "mail_admin_session";
 const DEFAULT_SESSION_TTL_HOURS = 12;
@@ -27,10 +32,6 @@ const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
 const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
 const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
-const encoder = new TextEncoder();
-
-const aesKeyCache = new Map();
-
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -276,7 +277,7 @@ function buildGroupSummaries(accounts) {
   return [
     {
       name: "",
-      label: "全部分组",
+      label: "鍏ㄩ儴鍒嗙粍",
       accountCount: accounts.length,
       attentionCount: totalAttention,
     },
@@ -316,7 +317,7 @@ async function createAccountRoute(request, env) {
     throw new HttpError(400, "Unable to determine account email.");
   }
 
-  const encryptedRefreshToken = await encryptText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
+  const encryptedRefreshToken = await encryptSecretText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
   const now = new Date().toISOString();
 
   await env.DB.prepare(
@@ -362,7 +363,7 @@ async function updateAccountRoute(request, env, accountId) {
   if (body.clientId || body.refreshToken) {
     clientId = requireString(body.clientId ?? existing.client_id, "clientId");
     const refreshToken = requireString(body.refreshToken, "refreshToken");
-    encryptedRefreshToken = await encryptText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
+    encryptedRefreshToken = await encryptSecretText(refreshToken, env.TOKEN_ENCRYPTION_SECRET);
   }
 
   const now = new Date().toISOString();
@@ -920,7 +921,7 @@ async function syncAccount(env, account) {
   let graphSyncError = null;
 
   try {
-    const refreshToken = await decryptText(
+    const refreshToken = await decryptSecretText(
       account.refresh_token_encrypted,
       env.TOKEN_ENCRYPTION_SECRET,
     );
@@ -2050,7 +2051,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
 
 function normalizeGroupName(value) {
   const input = typeof value === "string" ? value.trim() : "";
-  return input || "默认分组";
+  return input || "榛樿鍒嗙粍";
 }
 
 function addHours(date, hours) {
@@ -2098,80 +2099,11 @@ async function sha256Hex(text) {
     .join("");
 }
 
-async function encryptText(plainText, secret) {
-  if (!secret) {
-    throw new HttpError(500, "TOKEN_ENCRYPTION_SECRET is not configured.");
-  }
-
-  const key = await getAesKey(secret);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    encoder.encode(plainText),
-  );
-
-  return uint8ToBase64(iv) + "." + uint8ToBase64(new Uint8Array(encrypted));
-}
-
-async function decryptText(payload, secret) {
-  if (!secret) {
-    throw new HttpError(500, "TOKEN_ENCRYPTION_SECRET is not configured.");
-  }
-
-  const [ivEncoded, dataEncoded] = String(payload).split(".");
-  if (!ivEncoded || !dataEncoded) {
-    throw new Error("Encrypted token format is invalid.");
-  }
-
-  const key = await getAesKey(secret);
-  const iv = base64ToUint8(ivEncoded);
-  const data = base64ToUint8(dataEncoded);
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    data,
-  );
-
-  return new TextDecoder().decode(decrypted);
-}
-
-async function getAesKey(secret) {
-  if (aesKeyCache.has(secret)) {
-    return aesKeyCache.get(secret);
-  }
-
-  const material = await crypto.subtle.digest("SHA-256", encoder.encode(secret));
-  const keyPromise = crypto.subtle.importKey(
-    "raw",
-    material,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"],
-  );
-
-  aesKeyCache.set(secret, keyPromise);
-  return await keyPromise;
-}
-
 async function getSessionHash(token, env) {
   if (!env.SESSION_SECRET) {
     throw new HttpError(500, "SESSION_SECRET is not configured.");
   }
   return await sha256Hex(env.SESSION_SECRET + ":" + token);
-}
-
-function uint8ToBase64(value) {
-  let binary = "";
-  for (const item of value) {
-    binary += String.fromCharCode(item);
-  }
-  return btoa(binary);
-}
-
-function base64ToUint8(value) {
-  const binary = atob(value);
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
 }
 
 function sanitizeKeyPart(value) {
