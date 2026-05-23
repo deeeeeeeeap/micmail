@@ -21,14 +21,23 @@ const state = {
   },
   ui: {
     accountFormOpen: false,
-    bulkFormOpen: false
+    bulkFormOpen: false,
+    quickSyncEmail: ""
   },
   autoSyncing: false,
+  syncingAll: false,
+  syncingAccountId: "",
+  loadingDashboard: false,
   lastAutoSyncAt: 0
 };
 
 let autoRefreshTimer = null;
 let toastTimer = null;
+let filterDebounceTimer = null;
+let dashboardInFlight = null;
+let dashboardQueuedOptions = null;
+const scheduledRefreshTimers = new Set();
+const detailCache = new Map();
 
 async function api(path, options) {
   const response = await fetch(path, Object.assign({
@@ -204,6 +213,9 @@ function captureUiState() {
 
   const bulkCard = document.getElementById("bulk-account-card");
   if (bulkCard) state.ui.bulkFormOpen = bulkCard.open;
+
+  const quickSyncEmail = document.getElementById("quick-sync-email");
+  if (quickSyncEmail) state.ui.quickSyncEmail = quickSyncEmail.value;
 }
 
 function sanitizeFilters() {
@@ -231,32 +243,70 @@ function dashboardParams() {
 }
 
 async function refreshDashboard(options) {
-  const data = await api("/api/dashboard?" + dashboardParams().toString(), { method: "GET" });
-  state.accounts = data.accounts || [];
-  state.groups = data.groups || [];
-  state.messages = data.messages && data.messages.items ? data.messages.items : [];
-  state.stats.total = data.messages ? data.messages.total || 0 : 0;
-  state.sync = data.sync || {};
-  sanitizeFilters();
-
-  if (!state.messages.length) {
-    state.selectedMessage = null;
-    state.detail = null;
-  } else if (!selectedMessageRow()) {
-    state.selectedMessage = state.messages[0].id;
-    await loadMessageDetail(state.selectedMessage, { silent: true });
+  const requestedOptions = options || {};
+  if (dashboardInFlight) {
+    dashboardQueuedOptions = Object.assign({}, dashboardQueuedOptions || {}, requestedOptions, { skipAutoSync: true });
+    return await dashboardInFlight;
   }
 
-  if (state.activeView === "sync") await loadSyncRuns({ silent: true });
-  render();
-  if (!options || !options.skipAutoSync) maybeAutoSync();
+  state.loadingDashboard = true;
+  if (!requestedOptions.silent) render();
+
+  dashboardInFlight = (async function () {
+    try {
+      const data = await api("/api/dashboard?" + dashboardParams().toString(), { method: "GET" });
+      state.accounts = data.accounts || [];
+      state.groups = data.groups || [];
+      state.messages = data.messages && data.messages.items ? data.messages.items : [];
+      state.stats.total = data.messages ? data.messages.total || 0 : 0;
+      state.sync = data.sync || {};
+      sanitizeFilters();
+
+      if (!state.messages.length) {
+        state.selectedMessage = null;
+        state.detail = null;
+      } else if (!selectedMessageRow()) {
+        state.selectedMessage = state.messages[0].id;
+        await loadMessageDetail(state.selectedMessage, { silent: true });
+      }
+
+      if (state.activeView === "sync") await loadSyncRuns({ silent: true });
+      if (!requestedOptions.skipAutoSync) maybeAutoSync();
+    } finally {
+      state.loadingDashboard = false;
+      render();
+    }
+  })();
+
+  try {
+    return await dashboardInFlight;
+  } finally {
+    dashboardInFlight = null;
+    const queuedOptions = dashboardQueuedOptions;
+    dashboardQueuedOptions = null;
+    if (queuedOptions) {
+      refreshDashboard(queuedOptions).catch(function (error) {
+        showToast(error.message, "error");
+      });
+    }
+  }
 }
 
 async function loadMessageDetail(messageId, options) {
   state.selectedMessage = Number(messageId);
   if (!options || !options.silent) render();
+  if (detailCache.has(Number(messageId))) {
+    state.detail = detailCache.get(Number(messageId));
+    render();
+    mountMessageFrame();
+    return;
+  }
   const detail = await api("/api/messages/" + encodeURIComponent(messageId), { method: "GET" });
   state.detail = detail;
+  detailCache.set(Number(messageId), detail);
+  if (detailCache.size > 30) {
+    detailCache.delete(detailCache.keys().next().value);
+  }
   render();
   mountMessageFrame();
 }
@@ -294,6 +344,16 @@ function stopAutoRefresh() {
   autoRefreshTimer = null;
 }
 
+function scheduleDashboardRefresh(delayMs, options) {
+  const timer = setTimeout(function () {
+    scheduledRefreshTimers.delete(timer);
+    refreshDashboard(Object.assign({ skipAutoSync: true, silent: true }, options || {})).catch(function (error) {
+      showToast(error.message, "error");
+    });
+  }, delayMs);
+  scheduledRefreshTimers.add(timer);
+}
+
 async function maybeAutoSync() {
   if (!state.authenticated || state.busy || state.autoSyncing) return;
   if (Date.now() - state.lastAutoSyncAt < 5 * 60 * 1000) return;
@@ -304,8 +364,8 @@ async function maybeAutoSync() {
   render();
   try {
     await api("/api/sync/auto", { method: "POST", body: "{}" });
-    setTimeout(function () { refreshDashboard({ skipAutoSync: true }); }, 5000);
-    setTimeout(function () { refreshDashboard({ skipAutoSync: true }); }, 20000);
+    scheduleDashboardRefresh(5000);
+    scheduleDashboardRefresh(20000);
   } catch (error) {
     showToast("自动同步启动失败: " + error.message, "error");
   } finally {
@@ -369,6 +429,9 @@ async function handleLogout() {
   state.accounts = [];
   state.messages = [];
   state.detail = null;
+  detailCache.clear();
+  scheduledRefreshTimers.forEach(clearTimeout);
+  scheduledRefreshTimers.clear();
   stopAutoRefresh();
   render();
 }
@@ -473,35 +536,70 @@ function handleBulkFileSelect(event) {
 }
 
 async function handleSyncAll() {
-  if (state.busy) return;
-  state.busy = true;
+  if (state.syncingAll) return;
+  state.syncingAll = true;
   render();
   try {
     const result = await api("/api/sync/run", { method: "POST", body: "{}" });
-    await refreshDashboard();
+    scheduleDashboardRefresh(1800);
+    scheduleDashboardRefresh(8000);
     showToast("已提交后台同步，本批排队 " + (result.queued || 0) + " 个账号");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
-    state.busy = false;
+    state.syncingAll = false;
     render();
   }
 }
 
 async function handleSyncAccount(accountId) {
-  if (state.busy) return;
-  state.busy = true;
+  if (!accountId || state.syncingAccountId) return;
+  state.syncingAccountId = String(accountId);
+  markAccountSyncQueued(accountId);
   render();
   try {
     const result = await api("/api/accounts/" + encodeURIComponent(accountId) + "/sync", { method: "POST", body: "{}" });
-    await refreshDashboard();
-    showToast(result.status === "queued" ? "账号已加入后台同步队列" : "账号同步已完成");
+    scheduleDashboardRefresh(1800);
+    scheduleDashboardRefresh(8000);
+    scheduleDashboardRefresh(20000);
+    showToast((result.status === "queued" || result.status === "running") ? "账号已加入后台同步队列" : "账号同步已完成");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
-    state.busy = false;
+    state.syncingAccountId = "";
     render();
   }
+}
+
+async function handleQuickSyncAccount() {
+  if (state.syncingAccountId) return;
+  const input = document.getElementById("quick-sync-email");
+  const value = input ? input.value.trim().toLowerCase() : "";
+  const selected = value
+    ? state.accounts.find(function (account) { return account.email.toLowerCase() === value; })
+    : activeAccount();
+  if (!selected) {
+    showToast(value ? "没有找到这个邮箱账号" : "请先输入或选择要同步的邮箱", "error");
+    return;
+  }
+
+  state.ui.quickSyncEmail = selected.email;
+  state.activeView = "mail";
+  state.filters.group = normalizeAccountGroup(selected);
+  state.filters.accountId = String(selected.id);
+  await handleSyncAccount(selected.id);
+  refreshDashboard({ skipAutoSync: true, silent: true }).catch(function (error) {
+    showToast(error.message, "error");
+  });
+}
+
+function markAccountSyncQueued(accountId) {
+  const now = new Date().toISOString();
+  state.accounts = state.accounts.map(function (account) {
+    return String(account.id) === String(accountId)
+      ? Object.assign({}, account, { last_sync_status: "queued", last_sync_error: null, updated_at: now })
+      : account;
+  });
 }
 
 function requestSetGroup(accountId) {
@@ -555,6 +653,7 @@ function requestDeleteMessage(messageId) {
     danger: true,
     onConfirm: async function () {
       await api("/api/messages/" + encodeURIComponent(messageId), { method: "DELETE" });
+      detailCache.delete(Number(messageId));
       await refreshDashboard();
       showToast("归档邮件已删除");
     }
@@ -571,6 +670,10 @@ async function handleMarkRead(messageId, isRead) {
       body: JSON.stringify({ isRead: isRead })
     });
     if (state.detail && Number(state.detail.id) === Number(messageId)) state.detail.is_read = isRead ? 1 : 0;
+    if (detailCache.has(Number(messageId))) {
+      const cached = detailCache.get(Number(messageId));
+      detailCache.set(Number(messageId), Object.assign({}, cached, { is_read: isRead ? 1 : 0 }));
+    }
     state.messages = state.messages.map(function (item) {
       return Number(item.id) === Number(messageId) ? Object.assign({}, item, { is_read: isRead ? 1 : 0 }) : item;
     });
@@ -589,12 +692,22 @@ async function handleFilter(event) {
 }
 
 async function applyFilterControls(clearAccount) {
+  clearTimeout(filterDebounceTimer);
   state.filters.accountId = clearAccount ? "" : document.getElementById("filter-account").value;
   state.filters.folder = document.getElementById("filter-folder").value;
   state.filters.group = document.getElementById("filter-group").value;
   state.filters.keyword = document.getElementById("filter-keyword").value.trim();
   state.activeView = "mail";
   await refreshDashboard({ skipAutoSync: true });
+}
+
+function debounceFilterRefresh() {
+  clearTimeout(filterDebounceTimer);
+  filterDebounceTimer = setTimeout(function () {
+    applyFilterControls(false).catch(function (error) {
+      showToast(error.message, "error");
+    });
+  }, 450);
 }
 
 async function handleSelectGroup(groupName) {
@@ -642,13 +755,13 @@ function renderSidebar(groups) {
   ];
   const groupItems = groups.map(function (group) {
     const isActive = state.activeView === "mail" && state.filters.group === group.name;
-    const badge = group.attentionCount
-      ? "<span class=\"side-badge danger\">" + escapeHtml(group.attentionCount) + "</span>"
-      : "<span class=\"side-badge\">" + escapeHtml(group.accountCount || 0) + "</span>";
+    const alert = group.attentionCount
+      ? "<span class=\"side-alert\" title=\"需关注 " + escapeHtml(group.attentionCount) + " 个账号\">" + escapeHtml(group.attentionCount > 9 ? "9+" : group.attentionCount) + "</span>"
+      : "";
     return ""
       + "<button type=\"button\" class=\"side-group " + (isActive ? "active" : "") + "\" data-select-group=\"" + escapeHtml(group.name) + "\">"
       + "  <span><strong>" + escapeHtml(group.label || group.name || "全部分组") + "</strong><small>" + escapeHtml(group.accountCount || 0) + " 个账号</small></span>"
-      + badge
+      + alert
       + "</button>";
   }).join("");
 
@@ -657,11 +770,13 @@ function renderSidebar(groups) {
     + "  <div class=\"sidebar-brand\"><div class=\"brand-mark\">M</div><div><strong>MicMail</strong><span>Mail Archive</span></div></div>"
     + "  <nav class=\"side-nav\">" + navItems.map(function (item) { return "<button type=\"button\" class=\"side-nav-item " + (state.activeView === item.key ? "active" : "") + "\" data-view=\"" + item.key + "\">" + item.label + "</button>"; }).join("") + "</nav>"
     + "  <div class=\"side-section\"><div class=\"side-section-title\">分组</div><div class=\"side-group-list\">" + groupItems + "</div></div>"
-    + "  <div class=\"sidebar-foot\"><div><strong>" + escapeHtml(String(state.accounts.length)) + "</strong><span>账号</span></div><div><strong>" + escapeHtml(String(state.sync.attentionCount || 0)) + "</strong><span>需关注</span></div></div>"
+    + "  <div class=\"sidebar-context\"><span>" + escapeHtml(String(state.accounts.length)) + " 个账号</span><span>" + escapeHtml(String(state.sync.attentionCount || 0)) + " 个需关注</span></div>"
     + "</aside>";
 }
 
 function renderTopbar(groupOptions, accountOptions, disabled) {
+  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
+  const quickSyncDisabled = state.syncingAccountId ? " disabled" : disabled;
   return ""
     + "<header class=\"app-topbar\">"
     + "  <form id=\"filter-form\" class=\"topbar-filter\">"
@@ -669,12 +784,13 @@ function renderTopbar(groupOptions, accountOptions, disabled) {
     + "    <label><span>分组</span><select id=\"filter-group\"" + disabled + "><option value=\"\">全部分组</option>" + groupOptions.map(function (group) { return "<option value=\"" + escapeHtml(group.name) + "\"" + (state.filters.group === group.name ? " selected" : "") + ">" + escapeHtml(group.label || group.name) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>账号</span><select id=\"filter-account\"" + disabled + "><option value=\"\">" + (state.filters.group ? "全组账号" : "全部账号") + "</option>" + accountOptions.map(function (account) { return "<option value=\"" + escapeHtml(account.id) + "\"" + (String(account.id) === String(state.filters.accountId) ? " selected" : "") + ">" + escapeHtml(account.email) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>文件夹</span><select id=\"filter-folder\"" + disabled + "><option value=\"\">全部</option><option value=\"inbox\"" + (state.filters.folder === "inbox" ? " selected" : "") + ">inbox</option><option value=\"junkemail\"" + (state.filters.folder === "junkemail" ? " selected" : "") + ">junkemail</option></select></label>"
-    + "    <button class=\"btn primary\" type=\"submit\"" + disabled + ">查询</button>"
+    + "    <button class=\"btn primary\" type=\"submit\"" + disabled + ">" + (state.loadingDashboard ? "查询中" : "查询") + "</button>"
     + "  </form>"
     + "  <div class=\"topbar-actions\">"
+    + "    <div class=\"quick-sync\"><input id=\"quick-sync-email\" list=\"account-email-options\" value=\"" + escapeHtml(state.ui.quickSyncEmail || "") + "\" placeholder=\"输入邮箱同步\"" + quickSyncDisabled + " /><datalist id=\"account-email-options\">" + state.accounts.map(function (account) { return "<option value=\"" + escapeHtml(account.email) + "\"></option>"; }).join("") + "</datalist><button class=\"btn primary\" data-quick-sync-account" + quickSyncDisabled + ">" + (state.syncingAccountId ? "同步中" : "同步账号") + "</button></div>"
     + "    <span class=\"sync-summary\">最近同步 " + escapeHtml(formatDate(state.sync.latestSyncAt)) + "</span>"
-    + "    <button class=\"btn primary\" data-sync-all" + disabled + ">" + (state.autoSyncing ? "同步排队中" : "同步一批") + "</button>"
-    + "    <button class=\"btn text\" data-refresh-dashboard>刷新</button>"
+    + "    <button class=\"btn text\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "排队中" : "同步一批") + "</button>"
+    + "    <button class=\"btn text\" data-refresh-dashboard" + (state.loadingDashboard ? " disabled" : "") + ">刷新</button>"
     + "    <button class=\"btn text danger-text\" id=\"logout-btn\">退出</button>"
     + "  </div>"
     + "</header>";
@@ -730,9 +846,10 @@ function renderDetail() {
 }
 
 function renderSyncWorkspace(disabled) {
+  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
   return ""
     + "<main class=\"content-view\">"
-    + "  <div class=\"view-head\"><div><h2>同步记录</h2><p>最近同步任务、错误原因和归档数量。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + disabled + ">同步一批账号</button><button class=\"btn text\" data-load-sync-runs>刷新记录</button></div></div>"
+    + "  <div class=\"view-head\"><div><h2>同步记录</h2><p>最近同步任务、错误原因和归档数量。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button><button class=\"btn text\" data-load-sync-runs>刷新记录</button></div></div>"
     + "  <div class=\"sync-list\">" + (state.syncRuns.map(renderSyncRun).join("") || "<div class=\"empty\">暂无同步记录。</div>") + "</div>"
     + "</main>";
 }
@@ -748,9 +865,10 @@ function renderSyncRun(run) {
 }
 
 function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, disabled) {
+  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
   return ""
     + "<main class=\"content-view\">"
-    + "  <div class=\"view-head\"><div><h2>账号管理</h2><p>维护 OAuth refresh token、分组和同步状态。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + disabled + ">同步一批账号</button></div></div>"
+    + "  <div class=\"view-head\"><div><h2>账号管理</h2><p>维护 OAuth refresh token、分组和同步状态。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button></div></div>"
     + "  <section class=\"management-tools\">"
     + "    <details id=\"account-form-card\"" + accountFormOpen + "><summary>添加单个账号</summary><form id=\"account-form\" class=\"tool-form\"><label>邮箱地址（可选）<input id=\"account-email\" value=\"" + escapeHtml(accountDraft.email) + "\" placeholder=\"留空时尝试用 Graph 识别\"" + disabled + " /></label><label>分组<input id=\"account-group\" value=\"" + escapeHtml(accountDraft.groupName) + "\" placeholder=\"默认分组 / openai / 项目A\"" + disabled + " /></label><label>Client ID<input id=\"account-client-id\" required value=\"" + escapeHtml(accountDraft.clientId) + "\" placeholder=\"Azure App Client ID\"" + disabled + " /></label><label>Refresh Token<textarea id=\"account-refresh-token\" required placeholder=\"粘贴 refresh token\"" + disabled + ">" + escapeHtml(accountDraft.refreshToken) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">保存账号</button></form></details>"
     + "    <details id=\"bulk-account-card\"" + bulkFormOpen + "><summary>批量导入账号</summary><form id=\"bulk-account-form\" class=\"tool-form\"><p class=\"muted\">格式：邮箱----密码----ClientID----RefreshToken----分组</p><label>选择 TXT/CSV 文件<input id=\"bulk-account-file\" type=\"file\" accept=\".txt,.csv,text/plain\"" + disabled + " /></label><label>批量文本<textarea id=\"bulk-account-input\" placeholder=\"每行一个账号\" " + disabled + ">" + escapeHtml(state.drafts.bulkInput) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">批量导入</button></form></details>"
@@ -762,12 +880,13 @@ function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, di
 function renderAccount(account) {
   const isActive = String(account.id) === String(state.filters.accountId);
   const statusInfo = syncStatusInfo(account);
+  const syncDisabled = state.syncingAccountId && String(state.syncingAccountId) !== String(account.id) ? " disabled" : "";
   return ""
     + "<article class=\"account-row " + (isActive ? "active" : "") + "\">"
     + "  <div class=\"account-row-main\"><div><strong>" + escapeHtml(account.email) + "</strong><span>Client ID: " + escapeHtml(shortText(account.client_id, 30)) + "</span></div>" + renderStatusLabel(statusInfo) + "</div>"
     + "  <div class=\"account-row-meta\"><span>分组 " + escapeHtml(normalizeAccountGroup(account)) + "</span><span>最近同步 " + escapeHtml(formatDate(account.last_sync_at)) + "</span></div>"
     + (account.last_sync_error ? "<div class=\"account-error\">" + statusInfo.errorPrefix + ": " + escapeHtml(shortText(account.last_sync_error, 180)) + "</div>" : "")
-    + "  <div class=\"row-actions\"><button class=\"link-btn\" data-select-account=\"" + escapeHtml(account.id) + "\">查看邮件</button><button class=\"link-btn primary-link\" data-sync-account=\"" + escapeHtml(account.id) + "\">同步</button><button class=\"link-btn\" data-set-group=\"" + escapeHtml(account.id) + "\">分组</button><button class=\"link-btn danger-text\" data-delete-account=\"" + escapeHtml(account.id) + "\">删除</button></div>"
+    + "  <div class=\"row-actions\"><button class=\"link-btn\" data-select-account=\"" + escapeHtml(account.id) + "\">查看邮件</button><button class=\"link-btn primary-link\" data-sync-account=\"" + escapeHtml(account.id) + "\"" + syncDisabled + ">" + (String(state.syncingAccountId) === String(account.id) ? "同步中" : "同步") + "</button><button class=\"link-btn\" data-set-group=\"" + escapeHtml(account.id) + "\">分组</button><button class=\"link-btn danger-text\" data-delete-account=\"" + escapeHtml(account.id) + "\">删除</button></div>"
     + "</article>";
 }
 
@@ -833,6 +952,8 @@ function bindEvents() {
   if (bulkFile) bulkFile.onchange = handleBulkFileSelect;
   const filterForm = document.getElementById("filter-form");
   if (filterForm) filterForm.onsubmit = handleFilter;
+  const filterKeyword = document.getElementById("filter-keyword");
+  if (filterKeyword) filterKeyword.oninput = debounceFilterRefresh;
   const filterGroup = document.getElementById("filter-group");
   if (filterGroup) filterGroup.onchange = function () {
     const accountSelect = document.getElementById("filter-account");
@@ -847,6 +968,8 @@ function bindEvents() {
   if (filterFolder) filterFolder.onchange = function () {
     applyFilterControls(false).catch(function (error) { showToast(error.message, "error"); });
   };
+  const quickSync = document.querySelector("[data-quick-sync-account]");
+  if (quickSync) quickSync.onclick = handleQuickSyncAccount;
   Array.from(document.querySelectorAll("[data-view]")).forEach(function (button) {
     button.onclick = function () { setView(button.getAttribute("data-view")); };
   });

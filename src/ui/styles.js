@@ -244,49 +244,27 @@ label span {
   font-size: 11px;
 }
 
-.side-badge {
-  min-width: 22px;
-  height: 20px;
-  padding: 0 7px;
+.side-alert {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border-radius: 999px;
-  color: #c8d3e8;
-  background: rgba(255, 255, 255, 0.08);
-  font-size: 11px;
+  color: #fff;
+  background: rgba(220, 62, 85, 0.88);
+  font-size: 10px;
   font-weight: 800;
 }
 
-.side-badge.danger {
-  color: #ffd5dc;
-  background: rgba(220, 62, 85, 0.22);
-}
-
-.sidebar-foot {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+.sidebar-context {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
   padding-top: 12px;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.sidebar-foot div {
-  padding: 9px 10px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.sidebar-foot strong,
-.sidebar-foot span {
-  display: block;
-}
-
-.sidebar-foot strong {
-  font-size: 18px;
-}
-
-.sidebar-foot span {
   color: var(--sidebar-muted);
   font-size: 11px;
 }
@@ -299,10 +277,10 @@ label span {
 }
 
 .app-topbar {
-  min-height: 68px;
+  min-height: 98px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
   align-items: center;
   padding: 12px 18px;
   background: rgba(255, 255, 255, 0.92);
@@ -334,7 +312,18 @@ label span {
 }
 
 .topbar-actions {
-  justify-content: flex-end;
+  justify-content: flex-start;
+}
+
+.quick-sync {
+  min-width: 260px;
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto;
+  gap: 8px;
+}
+
+.quick-sync input {
+  min-height: 36px;
 }
 
 .sync-summary {
@@ -403,6 +392,10 @@ label span {
 .link-btn:hover,
 .primary-link {
   color: var(--primary);
+}
+
+.link-btn:disabled {
+  color: var(--muted-2);
 }
 
 .mail-workspace {
@@ -915,6 +908,10 @@ label span {
     justify-content: flex-start;
   }
 
+  .quick-sync {
+    min-width: min(100%, 360px);
+  }
+
   .mail-workspace {
     grid-template-columns: minmax(330px, 0.9fr) minmax(360px, 1.1fr);
   }
@@ -959,6 +956,10 @@ label span {
 
   .topbar-actions {
     align-items: flex-start;
+  }
+
+  .quick-sync {
+    width: 100%;
   }
 }
 
