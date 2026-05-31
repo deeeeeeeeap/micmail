@@ -780,7 +780,7 @@ function renderTopbar(groupOptions, accountOptions, disabled) {
   return ""
     + "<header class=\"app-topbar\">"
     + "  <form id=\"filter-form\" class=\"topbar-filter\">"
-    + "    <label class=\"search-field\"><span>搜索</span><input id=\"filter-keyword\" value=\"" + escapeHtml(state.filters.keyword || "") + "\" placeholder=\"搜索主题、发件人或正文\"" + disabled + " /></label>"
+    + "    <label class=\"search-field\"><span>搜索</span><input id=\"filter-keyword\" value=\"" + escapeHtml(state.filters.keyword || "") + "\" placeholder=\"搜索主题或发件人\"" + disabled + " /></label>"
     + "    <label><span>分组</span><select id=\"filter-group\"" + disabled + "><option value=\"\">全部分组</option>" + groupOptions.map(function (group) { return "<option value=\"" + escapeHtml(group.name) + "\"" + (state.filters.group === group.name ? " selected" : "") + ">" + escapeHtml(group.label || group.name) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>账号</span><select id=\"filter-account\"" + disabled + "><option value=\"\">" + (state.filters.group ? "全组账号" : "全部账号") + "</option>" + accountOptions.map(function (account) { return "<option value=\"" + escapeHtml(account.id) + "\"" + (String(account.id) === String(state.filters.accountId) ? " selected" : "") + ">" + escapeHtml(account.email) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>文件夹</span><select id=\"filter-folder\"" + disabled + "><option value=\"\">全部</option><option value=\"inbox\"" + (state.filters.folder === "inbox" ? " selected" : "") + ">inbox</option><option value=\"junkemail\"" + (state.filters.folder === "junkemail" ? " selected" : "") + ">junkemail</option></select></label>"

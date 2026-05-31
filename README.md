@@ -13,13 +13,13 @@
 
 ### 项目结构
 
-- [src/worker.js](/D:/下载/Compressed/Microsoft-Email-retrieva-main/src/worker.js)
+- `src/worker.js`
   Worker 主入口，负责页面输出、认证、账号管理、邮件归档 API、定时同步、D1/R2 操作。
-- [src/ui.js](/D:/下载/Compressed/Microsoft-Email-retrieva-main/src/ui.js)
+- `src/ui.js`
   直接由 Worker 返回的单页管理后台。
-- [schema.sql](/D:/下载/Compressed/Microsoft-Email-retrieva-main/schema.sql)
+- `schema.sql`
   D1 数据表结构：会话、邮箱账号、邮件、附件、同步记录。
-- [wrangler.jsonc](/D:/下载/Compressed/Microsoft-Email-retrieva-main/wrangler.jsonc)
+- `wrangler.jsonc`
   Worker 配置、D1/R2 绑定、Cron、环境变量。
 
 ### 主要能力
@@ -66,7 +66,7 @@ Copy-Item .dev.vars.example .dev.vars
    npm install
    ```
 
-2. 创建 D1 / R2，并修改 [wrangler.jsonc](/D:/下载/Compressed/Microsoft-Email-retrieva-main/wrangler.jsonc) 中的真实绑定信息
+2. 创建 D1 / R2，并修改 `wrangler.jsonc` 中的真实绑定信息
 
 3. 初始化远程 D1 表结构
 
@@ -118,6 +118,10 @@ Copy-Item .dev.vars.example .dev.vars
 ### 保留策略
 
 默认保留 90 天，由 `MAIL_RETENTION_DAYS` 控制。过期邮件及其 R2 附件对象会在定时任务中自动清理。
+
+### 搜索说明
+
+默认关键词搜索只匹配主题和发件人字段，避免在邮件正文上做高成本 LIKE 扫描。需要正文搜索时，可在 `/api/messages` 或 `/api/dashboard` 查询参数中加 `searchBody=1`。
 
 ### 说明
 
@@ -247,6 +251,10 @@ Then fill the values.
 ### Retention
 
 Default retention is 90 days, controlled by `MAIL_RETENTION_DAYS`. Expired messages and their R2 objects are removed during scheduled maintenance.
+
+### Search behavior
+
+Keyword search matches subject and sender fields by default to avoid expensive D1 `LIKE` scans over archived bodies. Add `searchBody=1` to `/api/messages` or `/api/dashboard` when body search is explicitly needed.
 
 ### Frontend structure
 

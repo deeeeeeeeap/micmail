@@ -529,7 +529,7 @@ async function dashboardRoute(url, env) {
 }
 
 async function listMessagesData(url, env) {
-  const page = clampInt(url.searchParams.get("page"), 1, 1);
+  const page = clampInt(url.searchParams.get("page"), 1, 1, 100000);
   const pageSize = clampInt(url.searchParams.get("pageSize"), 25, 1, 100);
   const offset = (page - 1) * pageSize;
   const filters = [];
@@ -556,10 +556,14 @@ async function listMessagesData(url, env) {
   const keyword = url.searchParams.get("keyword");
   if (keyword) {
     const like = "%" + keyword.trim() + "%";
-    filters.push(
-      "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ? OR m.body_text LIKE ?)",
-    );
-    params.push(like, like, like, like);
+    const searchBody = url.searchParams.get("searchBody") === "1";
+    filters.push(searchBody
+      ? "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ? OR m.body_text LIKE ?)"
+      : "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ?)");
+    params.push(like, like, like);
+    if (searchBody) {
+      params.push(like);
+    }
   }
 
   const dateFrom = url.searchParams.get("dateFrom");
@@ -943,6 +947,15 @@ async function syncAccount(env, account) {
       }
     } catch (graphError) {
       graphSyncError = summarizeUpstreamError(graphError);
+      if (!shouldAttemptImapFallback(graphError)) {
+        logInfo("graph_sync_failed_skip_imap", {
+          accountId: account.id,
+          email: account.email,
+          error: graphSyncError,
+        });
+        graphSyncError = null;
+        throw graphError;
+      }
       syncMode = "imap";
       logInfo("graph_sync_failed_try_imap", {
         accountId: account.id,
@@ -1090,7 +1103,7 @@ async function upsertMessage(env, accountId, folder, item) {
   const fromAddress = item.from?.emailAddress?.address || "";
   const fromName = item.from?.emailAddress?.name || "";
 
-  await env.DB.prepare(
+  const saved = await env.DB.prepare(
     `INSERT INTO messages (
       account_id, graph_message_id, internet_message_id, folder, subject, from_name, from_address,
       received_at, is_read, has_attachments, body_content_type, body_html, body_text,
@@ -1113,7 +1126,8 @@ async function upsertMessage(env, accountId, folder, item) {
       web_link = excluded.web_link,
       synced_at = excluded.synced_at,
       expires_at = excluded.expires_at,
-      updated_at = excluded.updated_at`,
+      updated_at = excluded.updated_at
+    RETURNING id`,
   )
     .bind(
       accountId,
@@ -1134,14 +1148,11 @@ async function upsertMessage(env, accountId, folder, item) {
       expiresAt,
       syncedAt,
     )
-    .run();
-
-  const saved = await env.DB.prepare(
-    "SELECT id FROM messages WHERE graph_message_id = ?",
-  )
-    .bind(item.id)
     .first();
 
+  if (!saved?.id) {
+    throw new Error("Message upsert did not return an id.");
+  }
   return saved.id;
 }
 
@@ -1154,25 +1165,42 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
   );
 
   const attachments = Array.isArray(payload.value) ? payload.value : [];
-  await purgeMessageAttachments(env, localMessageId);
+  const existingRows = await env.DB.prepare(
+    `SELECT id, graph_attachment_id, name, content_type, kind, size, storage_status, r2_key
+     FROM attachments
+     WHERE message_id = ?`,
+  )
+    .bind(localMessageId)
+    .all();
+  const existingByGraphId = new Map(
+    (existingRows.results ?? []).map((row) => [row.graph_attachment_id, row]),
+  );
+  const seenGraphIds = new Set();
 
   let stored = 0;
   for (const item of attachments) {
+    if (!item.id) {
+      continue;
+    }
     const kind = item["@odata.type"] || "unknown";
+    const existing = existingByGraphId.get(item.id);
+    const expectedR2Key = kind === "#microsoft.graph.fileAttachment"
+      ? buildAttachmentR2Key(accountId, graphMessageId, item)
+      : null;
+    const unchanged = attachmentMetadataMatches(existing, item, kind, expectedR2Key);
+    seenGraphIds.add(item.id);
+
+    if (unchanged) {
+      continue;
+    }
+
+    if (existing?.r2_key && existing.r2_key !== expectedR2Key) {
+      await env.ATTACHMENTS.delete(existing.r2_key);
+    }
+
     let r2Key = null;
     let storageStatus = "metadata_only";
-
     if (kind === "#microsoft.graph.fileAttachment") {
-      const objectKey =
-        "mail/" +
-        accountId +
-        "/" +
-        sanitizeKeyPart(graphMessageId) +
-        "/" +
-        sanitizeKeyPart(item.id) +
-        "/" +
-        sanitizeKeyPart(item.name || "attachment.bin");
-
       const binary = await graphFetchArrayBuffer(
         "https://graph.microsoft.com/v1.0/me/messages/" +
           encodeURIComponent(graphMessageId) +
@@ -1182,13 +1210,13 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
         accessToken,
       );
 
-      await env.ATTACHMENTS.put(objectKey, binary, {
+      await env.ATTACHMENTS.put(expectedR2Key, binary, {
         httpMetadata: {
           contentType: item.contentType || "application/octet-stream",
         },
       });
 
-      r2Key = objectKey;
+      r2Key = expectedR2Key;
       storageStatus = "stored";
       stored += 1;
     }
@@ -1196,7 +1224,14 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
     await env.DB.prepare(
       `INSERT INTO attachments (
         message_id, graph_attachment_id, name, content_type, kind, size, storage_status, r2_key
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_id, graph_attachment_id) DO UPDATE SET
+        name = excluded.name,
+        content_type = excluded.content_type,
+        kind = excluded.kind,
+        size = excluded.size,
+        storage_status = excluded.storage_status,
+        r2_key = excluded.r2_key`,
     )
       .bind(
         localMessageId,
@@ -1211,7 +1246,47 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
       .run();
   }
 
+  for (const row of existingRows.results ?? []) {
+    if (seenGraphIds.has(row.graph_attachment_id)) {
+      continue;
+    }
+    if (row.r2_key) {
+      await env.ATTACHMENTS.delete(row.r2_key);
+    }
+    await env.DB.prepare("DELETE FROM attachments WHERE id = ?").bind(row.id).run();
+  }
+
   return stored;
+}
+
+function buildAttachmentR2Key(accountId, graphMessageId, attachment) {
+  return (
+    "mail/" +
+    accountId +
+    "/" +
+    sanitizeKeyPart(graphMessageId) +
+    "/" +
+    sanitizeKeyPart(attachment.id) +
+    "/" +
+    sanitizeKeyPart(attachment.name || "attachment.bin")
+  );
+}
+
+function attachmentMetadataMatches(existing, item, kind, expectedR2Key) {
+  if (!existing) {
+    return false;
+  }
+  const expectedStorageStatus = kind === "#microsoft.graph.fileAttachment" ? "stored" : "metadata_only";
+  if (kind === "#microsoft.graph.fileAttachment" && existing.r2_key !== expectedR2Key) {
+    return false;
+  }
+  return (
+    existing.name === (item.name || "") &&
+    (existing.content_type || null) === (item.contentType || null) &&
+    existing.kind === kind &&
+    Number(existing.size || 0) === Number(item.size || 0) &&
+    existing.storage_status === expectedStorageStatus
+  );
 }
 
 async function purgeMessageAttachments(env, messageId) {
@@ -1289,6 +1364,34 @@ async function cleanupStaleSyncRuns(env) {
        AND finished_at IS NULL`,
   )
     .bind(new Date().toISOString(), staleBefore)
+    .run();
+  await cleanupStaleAccountSyncStates(env);
+}
+
+async function cleanupStaleAccountSyncStates(env) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  await env.DB.prepare(
+    `UPDATE mail_accounts
+     SET last_sync_status = 'pending_retry',
+         last_sync_error = 'Sync state marked stale after queued timeout.',
+         updated_at = ?
+     WHERE status = 'active'
+       AND last_sync_status = 'queued'
+       AND updated_at <= ?`,
+  )
+    .bind(nowIso, minutesAgoIso(now, getQueuedStaleMinutes(env)))
+    .run();
+  await env.DB.prepare(
+    `UPDATE mail_accounts
+     SET last_sync_status = 'pending_retry',
+         last_sync_error = 'Sync state marked stale after running timeout.',
+         updated_at = ?
+     WHERE status = 'active'
+       AND last_sync_status = 'running'
+       AND updated_at <= ?`,
+  )
+    .bind(nowIso, minutesAgoIso(now, getRunningStaleMinutes(env)))
     .run();
 }
 
@@ -2142,6 +2245,22 @@ function maskToken(token) {
 function summarizeUpstreamError(error) {
   const message = error && error.message ? String(error.message) : String(error);
   return message.replace(/\s+/g, " ").trim().slice(0, 600);
+}
+
+function shouldAttemptImapFallback(error) {
+  const message = summarizeUpstreamError(error).toLowerCase();
+  if (!message.includes("microsoft token refresh failed")) {
+    return true;
+  }
+  return ![
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "interaction_required",
+    "consent_required",
+    "expired",
+    "revoked",
+  ].some((marker) => message.includes(marker));
 }
 
 function summarizeSyncFailure(error, graphError = null) {
