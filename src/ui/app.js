@@ -22,7 +22,9 @@ const state = {
   ui: {
     accountFormOpen: false,
     bulkFormOpen: false,
-    quickSyncEmail: ""
+    quickSyncEmail: "",
+    accountStatusFilter: "",
+    syncNotice: null
   },
   autoSyncing: false,
   syncingAll: false,
@@ -121,6 +123,52 @@ function visibleAccounts() {
   });
 }
 
+function attentionAccounts() {
+  return state.accounts.filter(accountNeedsAttention);
+}
+
+function accountNeedsAttention(account) {
+  const status = account.last_sync_status || "idle";
+  return status === "pending_retry" || status === "error" || isTransientSyncError(account.last_sync_error);
+}
+
+function attentionAccountCount() {
+  const reported = Number(state.sync.attentionCount);
+  if (state.sync.attentionCount !== undefined && state.sync.attentionCount !== null && Number.isFinite(reported)) return reported;
+  return attentionAccounts().length;
+}
+
+function activeSyncingAccountCount() {
+  const reported = Number(state.sync.activeCount);
+  if (state.sync.activeCount !== undefined && state.sync.activeCount !== null && Number.isFinite(reported)) return reported;
+  return state.accounts.filter(function (account) {
+    return account.last_sync_status === "queued" || account.last_sync_status === "running";
+  }).length;
+}
+
+function managementAccounts() {
+  return visibleAccounts().filter(function (account) {
+    if (state.ui.accountStatusFilter === "attention") return accountNeedsAttention(account);
+    if (state.ui.accountStatusFilter === "active") {
+      return account.last_sync_status === "queued" || account.last_sync_status === "running";
+    }
+    if (state.ui.accountStatusFilter === "healthy") return !accountNeedsAttention(account);
+    return true;
+  });
+}
+
+function hasMailFilters() {
+  return Boolean(state.filters.accountId || state.filters.folder || state.filters.group || state.filters.keyword);
+}
+
+function currentSyncNotice() {
+  const notice = state.ui.syncNotice;
+  if (!notice || !notice.message) return null;
+  const age = Date.now() - Number(notice.at || 0);
+  const ttl = notice.status === "error" ? 300000 : 90000;
+  return age <= ttl ? notice : null;
+}
+
 function isTransientSyncError(error) {
   const message = String(error || "").toLowerCase();
   return [
@@ -172,6 +220,71 @@ function syncStatusInfo(account) {
   if (status === "pending_retry") return { className: "status-dot waiting", label: "等待重试", errorPrefix: "原因" };
   if (status === "error") return { className: "status-dot error", label: "异常", errorPrefix: "错误" };
   return { className: "status-dot", label: status, errorPrefix: "提示" };
+}
+
+function classifySyncError(error) {
+  const message = String(error || "");
+  const lower = message.toLowerCase();
+  if (!message) return { title: "", hint: "", action: "" };
+  if (lower.indexOf("invalid_grant") !== -1 || lower.indexOf("revoked") !== -1 || lower.indexOf("expired") !== -1) {
+    return { title: "授权可能失效", hint: "需要重新导入 refresh token 或检查 Client ID。", action: "edit" };
+  }
+  if (lower.indexOf("403") !== -1 || lower.indexOf("forbidden") !== -1) {
+    return { title: "权限不足或账号受限", hint: "通常需要检查 Microsoft 权限、Client ID 或账号状态。", action: "edit" };
+  }
+  if (isTransientSyncError(message)) {
+    return { title: "临时同步失败", hint: "多半是限流、网络或 IMAP 超时，可以稍后重试。", action: "retry" };
+  }
+  return { title: "同步失败", hint: "查看技术详情后决定重试或重新导入账号。", action: "details" };
+}
+
+function extractVerificationCode(detail) {
+  if (!detail) return "";
+  const text = [
+    detail.subject,
+    detail.body_text,
+    String(detail.body_html || "").replace(/<[^>]+>/g, " ")
+  ].join(" ");
+  const matches = text.match(/\b\d{4,8}\b/g) || [];
+  return matches.find(function (value) {
+    return value.length >= 5 && value.length <= 8;
+  }) || matches[0] || "";
+}
+
+function reconcileSyncNotice() {
+  const notice = state.ui.syncNotice;
+  if (!notice || !notice.accountId) return;
+  const account = state.accounts.find(function (item) {
+    return String(item.id) === String(notice.accountId);
+  });
+  if (!account) return;
+  const status = account.last_sync_status || "idle";
+  if (status === "success") {
+    state.ui.syncNotice = {
+      accountId: account.id,
+      email: account.email,
+      status: "success",
+      message: "同步完成，列表已自动刷新。",
+      at: Date.now()
+    };
+  } else if (accountNeedsAttention(account)) {
+    const info = classifySyncError(account.last_sync_error);
+    state.ui.syncNotice = {
+      accountId: account.id,
+      email: account.email,
+      status: "error",
+      message: info.title + "：" + info.hint,
+      at: Date.now()
+    };
+  } else if (status === "queued" || status === "running") {
+    state.ui.syncNotice = {
+      accountId: account.id,
+      email: account.email,
+      status: status,
+      message: status === "queued" ? "已排队，通常 5-20 秒内自动刷新。" : "正在同步，完成后会自动刷新。",
+      at: notice.at || Date.now()
+    };
+  }
 }
 
 function showToast(message, type) {
@@ -261,6 +374,7 @@ async function refreshDashboard(options) {
       state.stats.total = data.messages ? data.messages.total || 0 : 0;
       state.sync = data.sync || {};
       sanitizeFilters();
+      reconcileSyncNotice();
 
       if (!state.messages.length) {
         state.selectedMessage = null;
@@ -538,13 +652,24 @@ function handleBulkFileSelect(event) {
 async function handleSyncAll() {
   if (state.syncingAll) return;
   state.syncingAll = true;
+  state.ui.syncNotice = {
+    status: "queued",
+    message: "正在提交一批账号同步，完成后会自动刷新列表。",
+    at: Date.now()
+  };
   render();
   try {
     const result = await api("/api/sync/run", { method: "POST", body: "{}" });
+    state.ui.syncNotice = {
+      status: result.queued ? "queued" : "idle",
+      message: result.queued ? "已提交 " + result.queued + " 个账号同步，通常 5-20 秒内看到结果。" : "当前没有需要同步的账号。",
+      at: Date.now()
+    };
     scheduleDashboardRefresh(1800);
     scheduleDashboardRefresh(8000);
-    showToast("已提交后台同步，本批排队 " + (result.queued || 0) + " 个账号");
+    showToast(result.queued ? "已提交后台同步，本批排队 " + result.queued + " 个账号" : "当前没有需要同步的账号");
   } catch (error) {
+    state.ui.syncNotice = { status: "error", message: "同步提交失败：" + error.message, at: Date.now() };
     showToast(error.message, "error");
   } finally {
     state.syncingAll = false;
@@ -555,15 +680,37 @@ async function handleSyncAll() {
 async function handleSyncAccount(accountId) {
   if (!accountId || state.syncingAccountId) return;
   state.syncingAccountId = String(accountId);
+  const account = state.accounts.find(function (item) { return String(item.id) === String(accountId); });
+  state.ui.syncNotice = {
+    accountId: accountId,
+    email: account ? account.email : "",
+    status: "queued",
+    message: "正在同步" + (account ? " " + account.email : "当前账号") + "，完成后会自动刷新。",
+    at: Date.now()
+  };
   markAccountSyncQueued(accountId);
   render();
   try {
     const result = await api("/api/accounts/" + encodeURIComponent(accountId) + "/sync", { method: "POST", body: "{}" });
+    state.ui.syncNotice = {
+      accountId: accountId,
+      email: account ? account.email : result.email || "",
+      status: result.status || "queued",
+      message: (result.status === "queued" || result.status === "running") ? "已排队，通常 5-20 秒内自动刷新。" : "同步已完成，正在刷新列表。",
+      at: Date.now()
+    };
     scheduleDashboardRefresh(1800);
     scheduleDashboardRefresh(8000);
     scheduleDashboardRefresh(20000);
     showToast((result.status === "queued" || result.status === "running") ? "账号已加入后台同步队列" : "账号同步已完成");
   } catch (error) {
+    state.ui.syncNotice = {
+      accountId: accountId,
+      email: account ? account.email : "",
+      status: "error",
+      message: "同步失败：" + error.message,
+      at: Date.now()
+    };
     showToast(error.message, "error");
   } finally {
     state.syncingAccountId = "";
@@ -575,9 +722,15 @@ async function handleQuickSyncAccount() {
   if (state.syncingAccountId) return;
   const input = document.getElementById("quick-sync-email");
   const value = input ? input.value.trim().toLowerCase() : "";
-  const selected = value
-    ? state.accounts.find(function (account) { return account.email.toLowerCase() === value; })
-    : activeAccount();
+  const matches = value ? state.accounts.filter(function (account) {
+    return account.email.toLowerCase().indexOf(value) !== -1;
+  }) : [];
+  const exact = value ? matches.find(function (account) { return account.email.toLowerCase() === value; }) : null;
+  const selected = exact || (matches.length === 1 ? matches[0] : null) || (!value ? activeAccount() : null);
+  if (value && matches.length > 1 && !exact) {
+    showToast("找到 " + matches.length + " 个匹配账号，请输入更完整的邮箱", "error");
+    return;
+  }
   if (!selected) {
     showToast(value ? "没有找到这个邮箱账号" : "请先输入或选择要同步的邮箱", "error");
     return;
@@ -660,6 +813,20 @@ function requestDeleteMessage(messageId) {
   });
 }
 
+async function handleCopyCode(code) {
+  try {
+    await navigator.clipboard.writeText(code);
+    showToast("验证码已复制");
+  } catch (_error) {
+    openModal({
+      kind: "confirm",
+      title: "复制验证码",
+      description: "浏览器阻止了自动复制，请手动复制：" + code,
+      confirmText: "知道了"
+    });
+  }
+}
+
 async function handleMarkRead(messageId, isRead) {
   if (state.busy) return;
   state.busy = true;
@@ -712,6 +879,7 @@ function debounceFilterRefresh() {
 
 async function handleSelectGroup(groupName) {
   state.activeView = "mail";
+  state.ui.accountStatusFilter = "";
   state.filters.group = groupName || "";
   state.filters.accountId = "";
   await refreshDashboard({ skipAutoSync: true });
@@ -719,12 +887,75 @@ async function handleSelectGroup(groupName) {
 
 function setView(view) {
   state.activeView = view;
+  state.ui.accountStatusFilter = "";
   if (view === "sync") {
     loadSyncRuns().catch(function (error) {
       showToast(error.message, "error");
     });
   } else {
     render();
+  }
+}
+
+function openAttentionAccounts() {
+  state.activeView = "settings";
+  state.ui.accountStatusFilter = "attention";
+  state.filters.group = "";
+  state.filters.accountId = "";
+  render();
+}
+
+function viewAccountMail(accountId) {
+  state.activeView = "mail";
+  state.filters.accountId = String(accountId);
+  const account = activeAccount();
+  state.filters.group = account ? normalizeAccountGroup(account) : "";
+  refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
+}
+
+function viewAccountManagement(accountId) {
+  state.activeView = "settings";
+  state.ui.accountStatusFilter = "";
+  state.filters.accountId = String(accountId);
+  const account = activeAccount();
+  state.filters.group = account ? normalizeAccountGroup(account) : "";
+  render();
+}
+
+function clearMailFilters() {
+  state.filters = { accountId: "", folder: "", group: "", keyword: "" };
+  state.activeView = "mail";
+  refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
+}
+
+function handleEmptyAction(action) {
+  if (action === "add-account") {
+    state.activeView = "settings";
+    state.ui.accountFormOpen = true;
+    state.ui.bulkFormOpen = false;
+    render();
+    return;
+  }
+  if (action === "bulk-import") {
+    state.activeView = "settings";
+    state.ui.accountFormOpen = false;
+    state.ui.bulkFormOpen = true;
+    render();
+    return;
+  }
+  if (action === "clear-filters") {
+    clearMailFilters();
+    return;
+  }
+  if (action === "clear-group") {
+    state.filters.group = "";
+    state.filters.accountId = "";
+    state.ui.accountStatusFilter = "";
+    if (state.activeView === "mail") {
+      refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
+    } else {
+      render();
+    }
   }
 }
 
@@ -747,12 +978,40 @@ function renderStatusLabel(info) {
   return "<span class=\"status-label\"><span class=\"" + info.className + "\"></span>" + escapeHtml(info.label) + "</span>";
 }
 
+function renderStatusStrip() {
+  const account = activeAccount();
+  const notice = currentSyncNotice();
+  const activeCount = activeSyncingAccountCount();
+  const attentionCount = attentionAccountCount();
+  const accountText = account
+    ? "当前账号 " + account.email + " · " + syncStatusInfo(account).label
+    : (state.filters.group ? "当前分组 " + state.filters.group : "全部账号");
+  const noticeText = notice && notice.message
+    ? "<strong>" + escapeHtml(notice.email || "同步状态") + "</strong><span>" + escapeHtml(notice.message) + "</span>"
+    : "<strong>" + escapeHtml(accountText) + "</strong><span>最近同步 " + escapeHtml(formatDate(state.sync.latestSyncAt)) + " · " + activeCount + " 个同步中 · " + attentionCount + " 个需关注</span>";
+  return ""
+    + "<div class=\"status-strip " + (notice && notice.status === "error" ? "danger" : "") + "\">"
+    + "  <div class=\"status-strip-main\">" + noticeText + "</div>"
+    + "  <div class=\"status-strip-actions\">"
+    + (account ? "<button class=\"link-btn primary-link\" data-sync-current>同步当前账号</button>" : "")
+    + (attentionCount ? "<button class=\"link-btn danger-text\" data-open-attention>查看需关注</button>" : "")
+    + "<button class=\"link-btn\" data-view=\"sync\">同步记录</button>"
+    + "  </div>"
+    + "</div>";
+}
+
 function renderSidebar(groups) {
   const navItems = [
     { key: "mail", label: "邮件归档" },
     { key: "settings", label: "账号管理" },
     { key: "sync", label: "同步记录" }
   ];
+  const attentionCount = attentionAccountCount();
+  const attentionActive = state.activeView === "settings" && state.ui.accountStatusFilter === "attention";
+  const navMarkup = navItems.map(function (item) {
+    const isActive = state.activeView === item.key && !(item.key === "settings" && attentionActive);
+    return "<button type=\"button\" class=\"side-nav-item " + (isActive ? "active" : "") + "\" data-view=\"" + item.key + "\">" + item.label + "</button>";
+  }).join("");
   const groupItems = groups.map(function (group) {
     const isActive = state.activeView === "mail" && state.filters.group === group.name;
     const alert = group.attentionCount
@@ -768,9 +1027,10 @@ function renderSidebar(groups) {
   return ""
     + "<aside class=\"app-sidebar\">"
     + "  <div class=\"sidebar-brand\"><div class=\"brand-mark\">M</div><div><strong>MicMail</strong><span>Mail Archive</span></div></div>"
-    + "  <nav class=\"side-nav\">" + navItems.map(function (item) { return "<button type=\"button\" class=\"side-nav-item " + (state.activeView === item.key ? "active" : "") + "\" data-view=\"" + item.key + "\">" + item.label + "</button>"; }).join("") + "</nav>"
+    + "  <nav class=\"side-nav\">" + navMarkup + "</nav>"
+    + "  <div class=\"side-attention\"><button type=\"button\" class=\"side-nav-item " + (attentionActive ? "active" : "") + "\" data-open-attention>需关注 " + escapeHtml(String(attentionCount)) + "</button></div>"
     + "  <div class=\"side-section\"><div class=\"side-section-title\">分组</div><div class=\"side-group-list\">" + groupItems + "</div></div>"
-    + "  <div class=\"sidebar-context\"><span>" + escapeHtml(String(state.accounts.length)) + " 个账号</span><span>" + escapeHtml(String(state.sync.attentionCount || 0)) + " 个需关注</span></div>"
+    + "  <div class=\"sidebar-context\"><span>" + escapeHtml(String(state.accounts.length)) + " 个账号</span><span>" + escapeHtml(String(attentionCount)) + " 个需关注</span></div>"
     + "</aside>";
 }
 
@@ -784,15 +1044,15 @@ function renderTopbar(groupOptions, accountOptions, disabled) {
     + "    <label><span>分组</span><select id=\"filter-group\"" + disabled + "><option value=\"\">全部分组</option>" + groupOptions.map(function (group) { return "<option value=\"" + escapeHtml(group.name) + "\"" + (state.filters.group === group.name ? " selected" : "") + ">" + escapeHtml(group.label || group.name) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>账号</span><select id=\"filter-account\"" + disabled + "><option value=\"\">" + (state.filters.group ? "全组账号" : "全部账号") + "</option>" + accountOptions.map(function (account) { return "<option value=\"" + escapeHtml(account.id) + "\"" + (String(account.id) === String(state.filters.accountId) ? " selected" : "") + ">" + escapeHtml(account.email) + "</option>"; }).join("") + "</select></label>"
     + "    <label><span>文件夹</span><select id=\"filter-folder\"" + disabled + "><option value=\"\">全部</option><option value=\"inbox\"" + (state.filters.folder === "inbox" ? " selected" : "") + ">inbox</option><option value=\"junkemail\"" + (state.filters.folder === "junkemail" ? " selected" : "") + ">junkemail</option></select></label>"
-    + "    <button class=\"btn primary\" type=\"submit\"" + disabled + ">" + (state.loadingDashboard ? "查询中" : "查询") + "</button>"
+    + "    <button class=\"btn\" type=\"submit\"" + disabled + ">" + (state.loadingDashboard ? "查询中" : "查询") + "</button>"
     + "  </form>"
     + "  <div class=\"topbar-actions\">"
-    + "    <div class=\"quick-sync\"><input id=\"quick-sync-email\" list=\"account-email-options\" value=\"" + escapeHtml(state.ui.quickSyncEmail || "") + "\" placeholder=\"输入邮箱同步\"" + quickSyncDisabled + " /><datalist id=\"account-email-options\">" + state.accounts.map(function (account) { return "<option value=\"" + escapeHtml(account.email) + "\"></option>"; }).join("") + "</datalist><button class=\"btn primary\" data-quick-sync-account" + quickSyncDisabled + ">" + (state.syncingAccountId ? "同步中" : "同步账号") + "</button></div>"
-    + "    <span class=\"sync-summary\">最近同步 " + escapeHtml(formatDate(state.sync.latestSyncAt)) + "</span>"
-    + "    <button class=\"btn text\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "排队中" : "同步一批") + "</button>"
-    + "    <button class=\"btn text\" data-refresh-dashboard" + (state.loadingDashboard ? " disabled" : "") + ">刷新</button>"
+    + "    <label class=\"quick-sync\"><span>同步邮箱</span><div><input id=\"quick-sync-email\" list=\"account-email-options\" value=\"" + escapeHtml(state.ui.quickSyncEmail || "") + "\" placeholder=\"输入邮箱，支持模糊匹配\"" + quickSyncDisabled + " /><datalist id=\"account-email-options\">" + state.accounts.map(function (account) { return "<option value=\"" + escapeHtml(account.email) + "\"></option>"; }).join("") + "</datalist><button class=\"btn primary\" data-quick-sync-account" + quickSyncDisabled + ">" + (state.syncingAccountId ? "同步中" : "同步并查看") + "</button></div></label>"
+    + "    <button class=\"btn text\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "排队中" : "同步一批账号") + "</button>"
+    + "    <button class=\"btn text\" data-refresh-dashboard" + (state.loadingDashboard ? " disabled" : "") + ">刷新列表</button>"
     + "    <button class=\"btn text danger-text\" id=\"logout-btn\">退出</button>"
     + "  </div>"
+    + renderStatusStrip()
     + "</header>";
 }
 
@@ -802,12 +1062,24 @@ function renderMailWorkspace() {
     + "<main class=\"mail-workspace\">"
     + "  <section class=\"mail-list-pane\">"
     + "    <div class=\"pane-head\"><div><h2>邮件列表</h2><p>当前结果 " + escapeHtml(String(state.messages.length)) + " / 匹配 " + escapeHtml(String(resultLabel)) + "</p></div></div>"
-    + "    <div class=\"mail-list\">" + (state.messages.map(renderMessage).join("") || "<div class=\"empty\">当前条件下没有匹配的归档邮件。</div>") + "</div>"
+    + "    <div class=\"mail-list\">" + (state.messages.map(renderMessage).join("") || renderMailEmpty()) + "</div>"
     + "  </section>"
     + "  <section class=\"mail-detail-pane\">"
     + renderDetail()
     + "  </section>"
     + "</main>";
+}
+
+function renderMailEmpty() {
+  if (!state.accounts.length) {
+    return "<div class=\"empty\"><strong>还没有邮箱账号</strong><span>先添加或批量导入账号，再同步归档邮件。</span><div class=\"empty-actions\"><button class=\"btn primary\" data-empty-action=\"add-account\">添加账号</button><button class=\"btn text\" data-empty-action=\"bulk-import\">批量导入</button></div></div>";
+  }
+  const account = activeAccount();
+  const accountError = account && accountNeedsAttention(account) ? classifySyncError(account.last_sync_error) : null;
+  if (accountError) {
+    return "<div class=\"empty\"><strong>" + escapeHtml(accountError.title) + "</strong><span>" + escapeHtml(accountError.hint) + "</span><div class=\"empty-actions\"><button class=\"btn primary\" data-sync-current>重新同步</button><button class=\"btn text\" data-view=\"sync\">查看同步记录</button><button class=\"btn text\" data-run-view-account=\"" + escapeHtml(account.id) + "\">查看账号</button></div></div>";
+  }
+  return "<div class=\"empty\"><strong>没有匹配邮件</strong><span>" + (hasMailFilters() ? "当前筛选条件下没有归档邮件，可以清除筛选或同步当前账号。" : "当前还没有归档邮件，可以先同步账号。") + "</span><div class=\"empty-actions\">" + (hasMailFilters() ? "<button class=\"btn text\" data-empty-action=\"clear-filters\">清除筛选</button>" : "") + (account ? "<button class=\"btn primary\" data-sync-current>同步当前账号</button>" : "<button class=\"btn primary\" data-sync-all>同步一批账号</button>") + "</div></div>";
 }
 
 function renderMessage(message) {
@@ -824,6 +1096,7 @@ function renderMessage(message) {
 function renderDetail() {
   const detail = state.detail;
   if (!detail) return "<div class=\"empty detail-empty\">选择一封邮件后，这里会显示正文、附件和元数据。</div>";
+  const code = extractVerificationCode(detail);
   const attachments = detail.attachments && detail.attachments.length
     ? detail.attachments.map(function (attachment) {
         const downloadable = attachment.storage_status === "stored";
@@ -833,6 +1106,7 @@ function renderDetail() {
   return ""
     + "<div class=\"detail-wrap\">"
     + "  <header class=\"detail-head\"><div><h2>" + escapeHtml(detail.subject || "(无主题)") + "</h2><p>来自 " + escapeHtml(detail.from_name || detail.from_address || "未知发件人") + " · " + escapeHtml(detail.account_email || "") + "</p><p>收到时间 " + escapeHtml(formatDate(detail.received_at)) + "</p></div></header>"
+    + (code ? "  <div class=\"code-hint\"><span>检测到验证码</span><strong>" + escapeHtml(code) + "</strong><button class=\"btn primary\" data-copy-code=\"" + escapeHtml(code) + "\">复制验证码</button></div>" : "")
     + "  <div class=\"detail-actions\">"
     + "    <button class=\"link-btn\" data-toggle-read=\"" + escapeHtml(detail.id) + "\" data-target-read=\"" + (detail.is_read ? "0" : "1") + "\">" + (detail.is_read ? "标记未读" : "标记已读") + "</button>"
     + "    <button class=\"link-btn danger-text\" data-delete-message=\"" + escapeHtml(detail.id) + "\">删除归档</button>"
@@ -856,36 +1130,60 @@ function renderSyncWorkspace(disabled) {
 
 function renderSyncRun(run) {
   const statusClass = run.status === "success" ? "success" : run.status === "running" ? "waiting" : "error";
+  const errorInfo = run.error_text ? classifySyncError(run.error_text) : null;
+  const actions = run.account_id
+    ? "<div class=\"row-actions\"><button class=\"link-btn\" data-run-view-mail=\"" + escapeHtml(run.account_id) + "\">查看邮件</button><button class=\"link-btn primary-link\" data-sync-account=\"" + escapeHtml(run.account_id) + "\">重试账号</button><button class=\"link-btn\" data-run-view-account=\"" + escapeHtml(run.account_id) + "\">查看账号</button></div>"
+    : "";
   return ""
     + "<article class=\"sync-row\">"
     + "  <div class=\"sync-row-main\"><div><strong>" + escapeHtml(run.account_email || "系统任务") + "</strong><span>" + escapeHtml(formatDate(run.started_at)) + " → " + escapeHtml(formatDate(run.finished_at)) + "</span></div><span class=\"status-label\"><span class=\"status-dot " + statusClass + "\"></span>" + escapeHtml(run.status) + "</span></div>"
     + "  <div class=\"sync-row-meta\">邮件 " + escapeHtml(String(run.message_count || 0)) + " · 附件 " + escapeHtml(String(run.attachment_count || 0)) + " · " + escapeHtml(run.folder_scope || "-") + "</div>"
-    + (run.error_text ? "<div class=\"sync-error\">错误: " + escapeHtml(shortText(run.error_text, 220)) + "</div>" : "")
+    + (errorInfo ? "<div class=\"sync-error\"><strong>" + escapeHtml(errorInfo.title) + "</strong><span>" + escapeHtml(errorInfo.hint) + "</span><details><summary>查看技术详情</summary><p>" + escapeHtml(run.error_text) + "</p></details></div>" : "")
+    + actions
     + "</article>";
 }
 
 function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, disabled) {
   const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
+  const accounts = managementAccounts();
+  const groupLabel = state.filters.group ? " / " + state.filters.group : "";
+  const filters = [
+    { key: "", label: "全部" },
+    { key: "attention", label: "需关注" },
+    { key: "active", label: "同步中" },
+    { key: "healthy", label: "正常" }
+  ].map(function (item) {
+    return "<button class=\"link-btn " + (state.ui.accountStatusFilter === item.key ? "primary-link" : "") + "\" data-account-filter=\"" + escapeHtml(item.key) + "\">" + item.label + "</button>";
+  }).join("");
   return ""
     + "<main class=\"content-view\">"
-    + "  <div class=\"view-head\"><div><h2>账号管理</h2><p>维护 OAuth refresh token、分组和同步状态。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button></div></div>"
+    + "  <div class=\"view-head\"><div><h2>账号管理" + escapeHtml(groupLabel) + "</h2><p>优先处理账号状态、异常重试和分组维护；添加/导入在列表下方。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button><button class=\"btn text\" data-empty-action=\"add-account\">添加账号</button></div></div>"
+    + "  <div class=\"account-toolbar\"><span>筛选</span>" + filters + (state.filters.group ? "<button class=\"link-btn\" data-empty-action=\"clear-group\">查看全部分组</button>" : "") + "</div>"
+    + "  <section class=\"account-manage-list\">" + (accounts.map(renderAccount).join("") || renderAccountEmpty()) + "</section>"
     + "  <section class=\"management-tools\">"
     + "    <details id=\"account-form-card\"" + accountFormOpen + "><summary>添加单个账号</summary><form id=\"account-form\" class=\"tool-form\"><label>邮箱地址（可选）<input id=\"account-email\" value=\"" + escapeHtml(accountDraft.email) + "\" placeholder=\"留空时尝试用 Graph 识别\"" + disabled + " /></label><label>分组<input id=\"account-group\" value=\"" + escapeHtml(accountDraft.groupName) + "\" placeholder=\"默认分组 / openai / 项目A\"" + disabled + " /></label><label>Client ID<input id=\"account-client-id\" required value=\"" + escapeHtml(accountDraft.clientId) + "\" placeholder=\"Azure App Client ID\"" + disabled + " /></label><label>Refresh Token<textarea id=\"account-refresh-token\" required placeholder=\"粘贴 refresh token\"" + disabled + ">" + escapeHtml(accountDraft.refreshToken) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">保存账号</button></form></details>"
     + "    <details id=\"bulk-account-card\"" + bulkFormOpen + "><summary>批量导入账号</summary><form id=\"bulk-account-form\" class=\"tool-form\"><p class=\"muted\">格式：邮箱----密码----ClientID----RefreshToken----分组</p><label>选择 TXT/CSV 文件<input id=\"bulk-account-file\" type=\"file\" accept=\".txt,.csv,text/plain\"" + disabled + " /></label><label>批量文本<textarea id=\"bulk-account-input\" placeholder=\"每行一个账号\" " + disabled + ">" + escapeHtml(state.drafts.bulkInput) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">批量导入</button></form></details>"
     + "  </section>"
-    + "  <section class=\"account-manage-list\">" + (state.accounts.map(renderAccount).join("") || "<div class=\"empty\">还没有已保存账号。</div>") + "</section>"
     + "</main>";
+}
+
+function renderAccountEmpty() {
+  if (!state.accounts.length) {
+    return "<div class=\"empty\"><strong>还没有已保存账号</strong><span>添加账号后才能同步和查看邮件。</span><div class=\"empty-actions\"><button class=\"btn primary\" data-empty-action=\"add-account\">添加账号</button><button class=\"btn text\" data-empty-action=\"bulk-import\">批量导入</button></div></div>";
+  }
+  return "<div class=\"empty\"><strong>当前条件下没有账号</strong><span>可以清除状态筛选或查看全部分组。</span><div class=\"empty-actions\"><button class=\"btn text\" data-account-filter=\"\">清除状态筛选</button><button class=\"btn text\" data-empty-action=\"clear-group\">查看全部分组</button></div></div>";
 }
 
 function renderAccount(account) {
   const isActive = String(account.id) === String(state.filters.accountId);
   const statusInfo = syncStatusInfo(account);
   const syncDisabled = state.syncingAccountId && String(state.syncingAccountId) !== String(account.id) ? " disabled" : "";
+  const errorInfo = account.last_sync_error ? classifySyncError(account.last_sync_error) : null;
   return ""
     + "<article class=\"account-row " + (isActive ? "active" : "") + "\">"
     + "  <div class=\"account-row-main\"><div><strong>" + escapeHtml(account.email) + "</strong><span>Client ID: " + escapeHtml(shortText(account.client_id, 30)) + "</span></div>" + renderStatusLabel(statusInfo) + "</div>"
     + "  <div class=\"account-row-meta\"><span>分组 " + escapeHtml(normalizeAccountGroup(account)) + "</span><span>最近同步 " + escapeHtml(formatDate(account.last_sync_at)) + "</span></div>"
-    + (account.last_sync_error ? "<div class=\"account-error\">" + statusInfo.errorPrefix + ": " + escapeHtml(shortText(account.last_sync_error, 180)) + "</div>" : "")
+    + (errorInfo ? "<div class=\"account-error\"><strong>" + escapeHtml(errorInfo.title) + "</strong><span>" + escapeHtml(errorInfo.hint) + "</span><details><summary>技术详情</summary><p>" + escapeHtml(account.last_sync_error) + "</p></details></div>" : "")
     + "  <div class=\"row-actions\"><button class=\"link-btn\" data-select-account=\"" + escapeHtml(account.id) + "\">查看邮件</button><button class=\"link-btn primary-link\" data-sync-account=\"" + escapeHtml(account.id) + "\"" + syncDisabled + ">" + (String(state.syncingAccountId) === String(account.id) ? "同步中" : "同步") + "</button><button class=\"link-btn\" data-set-group=\"" + escapeHtml(account.id) + "\">分组</button><button class=\"link-btn danger-text\" data-delete-account=\"" + escapeHtml(account.id) + "\">删除</button></div>"
     + "</article>";
 }
@@ -973,6 +1271,9 @@ function bindEvents() {
   Array.from(document.querySelectorAll("[data-view]")).forEach(function (button) {
     button.onclick = function () { setView(button.getAttribute("data-view")); };
   });
+  Array.from(document.querySelectorAll("[data-open-attention]")).forEach(function (button) {
+    button.onclick = openAttentionAccounts;
+  });
   Array.from(document.querySelectorAll("[data-refresh-dashboard]")).forEach(function (button) {
     button.onclick = function () { refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); }); };
   });
@@ -982,8 +1283,28 @@ function bindEvents() {
   Array.from(document.querySelectorAll("[data-sync-all]")).forEach(function (button) {
     button.onclick = handleSyncAll;
   });
+  Array.from(document.querySelectorAll("[data-sync-current]")).forEach(function (button) {
+    button.onclick = function () {
+      const account = activeAccount();
+      if (!account) {
+        showToast("请先选择一个账号，或使用“同步一批账号”。", "error");
+        return;
+      }
+      handleSyncAccount(account.id);
+    };
+  });
   Array.from(document.querySelectorAll("[data-select-group]")).forEach(function (button) {
     button.onclick = function () { handleSelectGroup(button.getAttribute("data-select-group") || ""); };
+  });
+  Array.from(document.querySelectorAll("[data-account-filter]")).forEach(function (button) {
+    button.onclick = function () {
+      state.activeView = "settings";
+      state.ui.accountStatusFilter = button.getAttribute("data-account-filter") || "";
+      render();
+    };
+  });
+  Array.from(document.querySelectorAll("[data-empty-action]")).forEach(function (button) {
+    button.onclick = function () { handleEmptyAction(button.getAttribute("data-empty-action") || ""); };
   });
   Array.from(document.querySelectorAll("[data-select-account]")).forEach(function (button) {
     button.onclick = function () {
@@ -996,6 +1317,12 @@ function bindEvents() {
   });
   Array.from(document.querySelectorAll("[data-sync-account]")).forEach(function (button) {
     button.onclick = function () { handleSyncAccount(button.getAttribute("data-sync-account")); };
+  });
+  Array.from(document.querySelectorAll("[data-run-view-mail]")).forEach(function (button) {
+    button.onclick = function () { viewAccountMail(button.getAttribute("data-run-view-mail")); };
+  });
+  Array.from(document.querySelectorAll("[data-run-view-account]")).forEach(function (button) {
+    button.onclick = function () { viewAccountManagement(button.getAttribute("data-run-view-account")); };
   });
   Array.from(document.querySelectorAll("[data-set-group]")).forEach(function (button) {
     button.onclick = function () { requestSetGroup(button.getAttribute("data-set-group")); };
@@ -1021,6 +1348,9 @@ function bindEvents() {
     button.onclick = function () {
       handleMarkRead(Number(button.getAttribute("data-toggle-read")), button.getAttribute("data-target-read") === "1");
     };
+  });
+  Array.from(document.querySelectorAll("[data-copy-code]")).forEach(function (button) {
+    button.onclick = function () { handleCopyCode(button.getAttribute("data-copy-code") || ""); };
   });
   const modalCancel = document.querySelector("[data-modal-cancel]");
   if (modalCancel) modalCancel.onclick = closeModal;
