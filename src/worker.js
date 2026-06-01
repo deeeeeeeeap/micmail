@@ -14,6 +14,11 @@ import {
   decryptText as decryptSecretText,
   encryptText as encryptSecretText,
 } from "./lib/crypto.js";
+import {
+  makeAttachmentContentDisposition,
+  redactSensitiveText,
+  redactSensitiveValue,
+} from "./lib/safety.js";
 import { connect } from "cloudflare:sockets";
 const SESSION_COOKIE = "mail_admin_session";
 const DEFAULT_SESSION_TTL_HOURS = 12;
@@ -767,8 +772,7 @@ async function downloadAttachmentRoute(env, messageId, attachmentId) {
   return new Response(object.body, {
     headers: {
       "content-type": attachment.content_type || "application/octet-stream",
-      "content-disposition":
-        'attachment; filename="' + safeHeaderFilename(attachment.name || "attachment.bin") + '"',
+      "content-disposition": makeAttachmentContentDisposition(attachment.name || "attachment.bin"),
       "cache-control": "private, max-age=300",
     },
   });
@@ -973,20 +977,20 @@ async function syncAccount(env, account) {
 
     const finishedAt = new Date().toISOString();
     await env.DB.prepare(
+      `UPDATE sync_runs
+       SET status = 'success', finished_at = ?, message_count = ?, attachment_count = ?
+       WHERE id = ?`,
+    )
+      .bind(finishedAt, messageCount, attachmentCount, syncRun.meta.last_row_id)
+      .run();
+
+    await env.DB.prepare(
       `UPDATE mail_accounts
        SET last_sync_at = ?, last_sync_status = 'success', last_sync_error = NULL,
            delta_links_json = ?, updated_at = ?
        WHERE id = ?`,
     )
       .bind(finishedAt, JSON.stringify(cursorMap), finishedAt, account.id)
-      .run();
-
-    await env.DB.prepare(
-      `UPDATE sync_runs
-       SET status = 'success', finished_at = ?, message_count = ?, attachment_count = ?
-       WHERE id = ?`,
-    )
-      .bind(finishedAt, messageCount, attachmentCount, syncRun.meta.last_row_id)
       .run();
 
     logInfo("sync_success", {
@@ -1011,19 +1015,19 @@ async function syncAccount(env, account) {
     const syncError = summarizeSyncFailure(error, graphSyncError);
     const failureStatus = isTransientSyncError(syncError) ? "pending_retry" : "error";
     await env.DB.prepare(
-      `UPDATE mail_accounts
-       SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?, updated_at = ?
-       WHERE id = ?`,
-    )
-      .bind(finishedAt, failureStatus, syncError, finishedAt, account.id)
-      .run();
-
-    await env.DB.prepare(
       `UPDATE sync_runs
        SET status = 'error', finished_at = ?, message_count = ?, attachment_count = ?, error_text = ?
        WHERE id = ?`,
     )
       .bind(finishedAt, messageCount, attachmentCount, syncError, syncRun.meta.last_row_id)
+      .run();
+
+    await env.DB.prepare(
+      `UPDATE mail_accounts
+       SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+      .bind(finishedAt, failureStatus, syncError, finishedAt, account.id)
       .run();
 
     logInfo("sync_error", {
@@ -1053,7 +1057,14 @@ async function syncFolderMessages(env, account, accessToken, folder, cursorMap) 
   let cursor = url;
 
   while (url && pages < getMaxSyncPages(env)) {
-    const payload = await graphFetchJson(url, accessToken);
+    let payload;
+    try {
+      payload = await graphFetchJson(url, accessToken);
+    } catch (error) {
+      cursorMap[folder] = cursor;
+      await checkpointAccountCursors(env, account.id, cursorMap);
+      throw error;
+    }
     const items = Array.isArray(payload.value) ? payload.value : [];
 
     for (const item of items) {
@@ -1092,6 +1103,16 @@ async function syncFolderMessages(env, account, accessToken, folder, cursorMap) 
   }
 
   return { cursor, messageCount, attachmentCount };
+}
+
+async function checkpointAccountCursors(env, accountId, cursorMap) {
+  await env.DB.prepare(
+    `UPDATE mail_accounts
+     SET delta_links_json = ?, updated_at = ?
+     WHERE id = ?`,
+  )
+    .bind(JSON.stringify(cursorMap), new Date().toISOString(), accountId)
+    .run();
 }
 
 async function upsertMessage(env, accountId, folder, item) {
@@ -1397,7 +1418,7 @@ async function cleanupStaleAccountSyncStates(env) {
 
 async function cleanupOldSyncRuns(env) {
   await env.DB.prepare(
-    "DELETE FROM sync_runs WHERE started_at <= ?",
+    "DELETE FROM sync_runs WHERE started_at <= ? AND status != 'running'",
   )
     .bind(addDays(new Date(), -getSyncRunRetentionDays(env)).toISOString())
     .run();
@@ -1434,7 +1455,11 @@ async function refreshAccessToken(env, clientId, refreshToken, scope = null) {
 
   if (!response.ok) {
     const detail = await response.text();
-    throw new Error("Microsoft token refresh failed: " + detail);
+    const parsed = parseJsonObject(detail);
+    const error = new Error("Microsoft token refresh failed: HTTP " + response.status + " " + redactSensitiveText(detail));
+    error.status = response.status;
+    error.code = parsed.error || "";
+    throw error;
   }
 
   const payload = await response.json();
@@ -1483,34 +1508,80 @@ function buildDeltaUrl(env, folder) {
 }
 
 async function graphFetchJson(url, accessToken) {
-  const response = await fetch(url, {
+  const response = await graphFetchWithRetry(url, {
     headers: {
       authorization: "Bearer " + accessToken,
       prefer: "odata.maxpagesize=50",
     },
+    errorPrefix: "Microsoft Graph request failed",
   });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error("Microsoft Graph request failed (" + response.status + "): " + detail);
-  }
 
   return await response.json();
 }
 
 async function graphFetchArrayBuffer(url, accessToken) {
-  const response = await fetch(url, {
+  const response = await graphFetchWithRetry(url, {
     headers: {
       authorization: "Bearer " + accessToken,
     },
+    errorPrefix: "Microsoft Graph binary request failed",
   });
 
-  if (!response.ok) {
-    const detail = await response.text();
-    throw new Error("Microsoft Graph binary request failed (" + response.status + "): " + detail);
-  }
-
   return await response.arrayBuffer();
+}
+
+async function graphFetchWithRetry(url, options) {
+  const attempts = 3;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, { headers: options.headers });
+      if (!response.ok) {
+        throw await createGraphHttpError(response, options.errorPrefix);
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts - 1 || !isRetryableGraphError(error)) {
+        throw error;
+      }
+      const retryDelayMs = Math.min(8000, Math.max(error.retryAfterMs || 0, 500 * 2 ** attempt + Math.floor(Math.random() * 250)));
+      await delay(retryDelayMs);
+    }
+  }
+  throw lastError;
+}
+
+async function createGraphHttpError(response, prefix) {
+  const detail = await response.text();
+  const parsed = parseJsonObject(detail);
+  const code = parsed.error?.code || parsed.code || "";
+  const error = new Error(prefix + " (" + response.status + "): " + redactSensitiveText(detail));
+  error.status = response.status;
+  error.code = code;
+  error.retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+  return error;
+}
+
+function isRetryableGraphError(error) {
+  const status = Number(error?.status || 0);
+  if (status === 429 || status === 503 || status === 504 || status >= 500) return true;
+  const code = String(error?.code || "").toLowerCase();
+  if (["toomanyrequests", "ratelimitexceeded", "serviceunavailable", "internalservererror", "timeout"].includes(code)) return true;
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("network") || message.includes("timeout") || message.includes("timed out");
+}
+
+function parseRetryAfterMs(value) {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(value);
+  return Number.isNaN(dateMs) ? 0 : Math.max(0, dateMs - Date.now());
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function syncImapFolderMessages(env, account, accessToken, folder, cursorMap = {}) {
@@ -1568,6 +1639,8 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
         messageCount += 1;
       }
       lastUid = Math.max(lastUid, ...chunk);
+      cursorMap[cursorKey] = lastUid;
+      await checkpointAccountCursors(env, account.id, cursorMap);
     }
 
     return { messageCount, mailbox, lastUid };
@@ -1719,15 +1792,17 @@ function makeXoauth2Token(email, accessToken) {
 }
 
 function parseImapSearchUids(response) {
-  const match = response.match(/\* SEARCH ([\d\s]*)/i);
-  if (!match) {
-    return [];
+  const ids = [];
+  const pattern = /\* SEARCH ([\d\s]*)/gi;
+  let match;
+  while ((match = pattern.exec(response)) !== null) {
+    const values = match[1].trim().split(/\s+/);
+    for (const value of values) {
+      const id = Number.parseInt(value, 10);
+      if (Number.isInteger(id) && id > 0) ids.push(id);
+    }
   }
-  return match[1]
-    .trim()
-    .split(/\s+/)
-    .map((value) => Number.parseInt(value, 10))
-    .filter((value) => Number.isInteger(value) && value > 0);
+  return ids;
 }
 
 function extractImapLiteralBodies(response) {
@@ -2118,7 +2193,13 @@ function minutesAgoIso(now, minutes) {
 }
 
 function isTransientSyncError(error) {
-  const message = String(error || "").toLowerCase();
+  const status = Number(error?.status || 0);
+  if (status === 429 || status === 503 || status === 504 || status >= 500) return true;
+  const code = String(error?.code || error?.error?.code || error?.odataError?.code || "").toLowerCase();
+  if (["toomanyrequests", "ratelimitexceeded", "serviceunavailable", "internalservererror", "timeout"].includes(code)) {
+    return true;
+  }
+  const message = String(error?.message || error || "").toLowerCase();
   return [
     "too many",
     "429",
@@ -2231,10 +2312,6 @@ function sanitizeKeyPart(value) {
   return encodeURIComponent(String(value).replace(/\//g, "_"));
 }
 
-function safeHeaderFilename(value) {
-  return String(value).replace(/"/g, "");
-}
-
 function maskToken(token) {
   if (!token || token.length < 12) {
     return "***";
@@ -2244,12 +2321,12 @@ function maskToken(token) {
 
 function summarizeUpstreamError(error) {
   const message = error && error.message ? String(error.message) : String(error);
-  return message.replace(/\s+/g, " ").trim().slice(0, 600);
+  return redactSensitiveText(message).replace(/\s+/g, " ").trim().slice(0, 600);
 }
 
 function shouldAttemptImapFallback(error) {
   const message = summarizeUpstreamError(error).toLowerCase();
-  if (!message.includes("microsoft token refresh failed")) {
+  if (!message.startsWith("microsoft token refresh failed:")) {
     return true;
   }
   return ![
@@ -2258,8 +2335,6 @@ function shouldAttemptImapFallback(error) {
     "unauthorized_client",
     "interaction_required",
     "consent_required",
-    "expired",
-    "revoked",
   ].some((marker) => message.includes(marker));
 }
 
@@ -2276,7 +2351,7 @@ function logInfo(event, detail) {
     JSON.stringify({
       level: "info",
       event,
-      ...detail,
+      ...redactSensitiveValue(detail),
       at: new Date().toISOString(),
     }),
   );

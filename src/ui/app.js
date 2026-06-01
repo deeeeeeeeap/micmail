@@ -40,6 +40,7 @@ let dashboardInFlight = null;
 let dashboardQueuedOptions = null;
 const scheduledRefreshTimers = new Set();
 const detailCache = new Map();
+let modalReturnFocus = null;
 
 async function api(path, options) {
   const response = await fetch(path, Object.assign({
@@ -300,13 +301,45 @@ function showToast(message, type) {
 }
 
 function openModal(config) {
+  modalReturnFocus = document.activeElement;
   state.modal = config;
   render();
+  focusModal();
 }
 
 function closeModal() {
   state.modal = null;
   render();
+  if (modalReturnFocus && document.contains(modalReturnFocus) && typeof modalReturnFocus.focus === "function") {
+    const target = modalReturnFocus;
+    setTimeout(function () { target.focus(); }, 0);
+  }
+  modalReturnFocus = null;
+}
+
+function focusModal() {
+  setTimeout(function () {
+    const modal = document.querySelector(".modal-card");
+    if (!modal) return;
+    const target = modal.querySelector("input, textarea, select, button, a[href], [tabindex]:not([tabindex='-1'])") || modal;
+    if (target && typeof target.focus === "function") target.focus();
+  }, 0);
+}
+
+function trapModalFocus(event, modal) {
+  if (event.key !== "Tab") return;
+  const focusable = Array.from(modal.querySelectorAll("input, textarea, select, button, a[href], [tabindex]:not([tabindex='-1'])"))
+    .filter(function (item) { return !item.disabled && item.offsetParent !== null; });
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function captureUiState() {
@@ -588,15 +621,32 @@ function parseBulkAccounts(input) {
   }).filter(Boolean);
 
   return lines.map(function (line, index) {
+    if (line.charAt(0) === "{") return parseBulkJsonLine(line, index);
     const parts = line.split("----");
     if (parts.length < 4) throw new Error("第 " + (index + 1) + " 行格式错误，必须是 邮箱----密码----ClientID----RefreshToken");
+    if (parts.length > 5) throw new Error("第 " + (index + 1) + " 行包含多个 ----，为避免 refresh token 被截断，请改用 JSON Lines 格式");
     const email = (parts[0] || "").trim();
     const clientId = (parts[2] || "").trim();
-    const refreshToken = parts.length > 4 ? (parts[3] || "").trim() : parts.slice(3).join("----").trim();
-    const groupName = (parts[5] || parts[4] || "").trim();
+    const refreshToken = (parts[3] || "").trim();
+    const groupName = (parts[4] || "").trim();
     if (!email || !clientId || !refreshToken) throw new Error("第 " + (index + 1) + " 行缺少邮箱、ClientID 或 RefreshToken");
     return { email: email, clientId: clientId, refreshToken: refreshToken, groupName: groupName };
   });
+}
+
+function parseBulkJsonLine(line, index) {
+  let item;
+  try {
+    item = JSON.parse(line);
+  } catch (_error) {
+    throw new Error("第 " + (index + 1) + " 行 JSON Lines 格式错误");
+  }
+  const email = String(item.email || "").trim();
+  const clientId = String(item.clientId || item.client_id || "").trim();
+  const refreshToken = String(item.refreshToken || item.refresh_token || "").trim();
+  const groupName = String(item.groupName || item.group_name || item.group || "").trim();
+  if (!email || !clientId || !refreshToken) throw new Error("第 " + (index + 1) + " 行缺少 email、clientId 或 refreshToken");
+  return { email: email, clientId: clientId, refreshToken: refreshToken, groupName: groupName };
 }
 
 async function handleBulkImport(event) {
@@ -1162,7 +1212,7 @@ function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, di
     + "  <section class=\"account-manage-list\">" + (accounts.map(renderAccount).join("") || renderAccountEmpty()) + "</section>"
     + "  <section class=\"management-tools\">"
     + "    <details id=\"account-form-card\"" + accountFormOpen + "><summary>添加单个账号</summary><form id=\"account-form\" class=\"tool-form\"><label>邮箱地址（可选）<input id=\"account-email\" value=\"" + escapeHtml(accountDraft.email) + "\" placeholder=\"留空时尝试用 Graph 识别\"" + disabled + " /></label><label>分组<input id=\"account-group\" value=\"" + escapeHtml(accountDraft.groupName) + "\" placeholder=\"默认分组 / openai / 项目A\"" + disabled + " /></label><label>Client ID<input id=\"account-client-id\" required value=\"" + escapeHtml(accountDraft.clientId) + "\" placeholder=\"Azure App Client ID\"" + disabled + " /></label><label>Refresh Token<textarea id=\"account-refresh-token\" required placeholder=\"粘贴 refresh token\"" + disabled + ">" + escapeHtml(accountDraft.refreshToken) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">保存账号</button></form></details>"
-    + "    <details id=\"bulk-account-card\"" + bulkFormOpen + "><summary>批量导入账号</summary><form id=\"bulk-account-form\" class=\"tool-form\"><p class=\"muted\">格式：邮箱----密码----ClientID----RefreshToken----分组</p><label>选择 TXT/CSV 文件<input id=\"bulk-account-file\" type=\"file\" accept=\".txt,.csv,text/plain\"" + disabled + " /></label><label>批量文本<textarea id=\"bulk-account-input\" placeholder=\"每行一个账号\" " + disabled + ">" + escapeHtml(state.drafts.bulkInput) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">批量导入</button></form></details>"
+    + "    <details id=\"bulk-account-card\"" + bulkFormOpen + "><summary>批量导入账号</summary><form id=\"bulk-account-form\" class=\"tool-form\"><p class=\"muted\">格式：邮箱----密码----ClientID----RefreshToken----分组；如果 token 含 ----，请改用 JSON Lines。</p><label>选择 TXT/CSV 文件<input id=\"bulk-account-file\" type=\"file\" accept=\".txt,.csv,text/plain\"" + disabled + " /></label><label>批量文本<textarea id=\"bulk-account-input\" placeholder=\"每行一个账号，或 JSON Lines\" " + disabled + ">" + escapeHtml(state.drafts.bulkInput) + "</textarea></label><button class=\"btn primary\" type=\"submit\"" + disabled + ">批量导入</button></form></details>"
     + "  </section>"
     + "</main>";
 }
@@ -1220,7 +1270,7 @@ function renderModal() {
     ? "<label>分组名称<input id=\"modal-input\" value=\"" + escapeHtml(modal.value || "") + "\" /></label>"
     : "";
   return ""
-    + "<div class=\"modal-backdrop\"><div class=\"modal-card\"><h3>" + escapeHtml(modal.title || "确认操作") + "</h3><p>" + escapeHtml(modal.description || "") + "</p>" + input + "<div class=\"actions\"><button class=\"btn text\" data-modal-cancel>取消</button><button class=\"btn " + (modal.danger ? "danger" : "primary") + "\" data-modal-confirm>" + escapeHtml(modal.confirmText || "确认") + "</button></div></div></div>";
+    + "<div class=\"modal-backdrop\"><div class=\"modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"modal-title\" tabindex=\"-1\"><h3 id=\"modal-title\">" + escapeHtml(modal.title || "确认操作") + "</h3><p>" + escapeHtml(modal.description || "") + "</p>" + input + "<div class=\"actions\"><button class=\"btn text\" data-modal-cancel>取消</button><button class=\"btn " + (modal.danger ? "danger" : "primary") + "\" data-modal-confirm>" + escapeHtml(modal.confirmText || "确认") + "</button></div></div></div>";
 }
 
 function render() {
@@ -1352,6 +1402,13 @@ function bindEvents() {
   Array.from(document.querySelectorAll("[data-copy-code]")).forEach(function (button) {
     button.onclick = function () { handleCopyCode(button.getAttribute("data-copy-code") || ""); };
   });
+  document.onkeydown = function (event) {
+    if (event.key === "Escape" && state.modal) closeModal();
+  };
+  const modalCard = document.querySelector(".modal-card");
+  if (modalCard) {
+    modalCard.onkeydown = function (event) { trapModalFocus(event, modalCard); };
+  }
   const modalCancel = document.querySelector("[data-modal-cancel]");
   if (modalCancel) modalCancel.onclick = closeModal;
   const modalConfirm = document.querySelector("[data-modal-confirm]");
