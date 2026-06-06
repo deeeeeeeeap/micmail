@@ -36,6 +36,7 @@ const DEFAULT_IMAP_FETCH_BATCH_SIZE = 1;
 const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
 const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
 const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
+const EXPIRED_ARCHIVE_CLEANUP_LIMIT = 100;
 const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 export default {
@@ -409,6 +410,10 @@ async function syncSingleAccountRoute(env, accountId, ctx) {
     throw new HttpError(404, "Account not found.");
   }
 
+  if (account.status !== "active") {
+    throw new HttpError(400, "Account is inactive and cannot be synced.");
+  }
+
   if (isFreshSyncInProgress(env, account, new Date())) {
     return jsonResponse({
       success: true,
@@ -542,8 +547,12 @@ async function listMessagesData(url, env) {
 
   const accountId = url.searchParams.get("accountId");
   if (accountId) {
+    const parsedAccountId = Number(accountId);
+    if (!Number.isInteger(parsedAccountId) || parsedAccountId < 1) {
+      throw new HttpError(400, "Invalid accountId.");
+    }
     filters.push("m.account_id = ?");
-    params.push(Number(accountId));
+    params.push(parsedAccountId);
   }
 
   const folder = url.searchParams.get("folder");
@@ -558,9 +567,9 @@ async function listMessagesData(url, env) {
     params.push(groupName);
   }
 
-  const keyword = url.searchParams.get("keyword");
+  const keyword = (url.searchParams.get("keyword") || "").trim();
   if (keyword) {
-    const like = "%" + keyword.trim() + "%";
+    const like = "%" + keyword + "%";
     const searchBody = url.searchParams.get("searchBody") === "1";
     filters.push(searchBody
       ? "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ? OR m.body_text LIKE ?)"
@@ -773,7 +782,8 @@ async function downloadAttachmentRoute(env, messageId, attachmentId) {
     headers: {
       "content-type": attachment.content_type || "application/octet-stream",
       "content-disposition": makeAttachmentContentDisposition(attachment.name || "attachment.bin"),
-      "cache-control": "private, max-age=300",
+      "cache-control": "no-store",
+      ...securityHeaders(),
     },
   });
 }
@@ -1059,7 +1069,7 @@ async function syncFolderMessages(env, account, accessToken, folder, cursorMap) 
   while (url && pages < getMaxSyncPages(env)) {
     let payload;
     try {
-      payload = await graphFetchJson(url, accessToken);
+      payload = await graphFetchJson(url, accessToken, { pageSize: getSyncPageSize(env) });
     } catch (error) {
       cursorMap[folder] = cursor;
       await checkpointAccountCursors(env, account.id, cursorMap);
@@ -1363,9 +1373,9 @@ async function deleteMessageArchive(env, messageId) {
 
 async function cleanupExpiredArchive(env) {
   const expiredMessages = await env.DB.prepare(
-    "SELECT id FROM messages WHERE expires_at <= ?",
+    "SELECT id FROM messages WHERE expires_at <= ? ORDER BY expires_at ASC, id ASC LIMIT ?",
   )
-    .bind(new Date().toISOString())
+    .bind(new Date().toISOString(), EXPIRED_ARCHIVE_CLEANUP_LIMIT)
     .all();
 
   for (const row of expiredMessages.results ?? []) {
@@ -1507,12 +1517,15 @@ function buildDeltaUrl(env, folder) {
   );
 }
 
-async function graphFetchJson(url, accessToken) {
+async function graphFetchJson(url, accessToken, options = {}) {
+  const headers = {
+    authorization: "Bearer " + accessToken,
+  };
+  if (options.pageSize) {
+    headers.prefer = "odata.maxpagesize=" + String(options.pageSize);
+  }
   const response = await graphFetchWithRetry(url, {
-    headers: {
-      authorization: "Bearer " + accessToken,
-      prefer: "odata.maxpagesize=50",
-    },
+    headers,
     errorPrefix: "Microsoft Graph request failed",
   });
 
@@ -2319,6 +2332,33 @@ function maskToken(token) {
   return token.slice(0, 6) + "..." + token.slice(-4);
 }
 
+function maskEmail(email) {
+  const value = String(email || "");
+  const at = value.indexOf("@");
+  if (at <= 0) return value ? "***" : "";
+  const local = value.slice(0, at);
+  const domain = value.slice(at + 1);
+  return local.slice(0, Math.min(2, local.length)) + "***@" + domain;
+}
+
+function maskLogEmails(value, key = "") {
+  if (Array.isArray(value)) {
+    return value.map((item) => maskLogEmails(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([entryKey, entryValue]) => [
+        entryKey,
+        maskLogEmails(entryValue, entryKey),
+      ]),
+    );
+  }
+  if (typeof value === "string" && key.toLowerCase().includes("email")) {
+    return maskEmail(value);
+  }
+  return value;
+}
+
 function summarizeUpstreamError(error) {
   const message = error && error.message ? String(error.message) : String(error);
   return redactSensitiveText(message).replace(/\s+/g, " ").trim().slice(0, 600);
@@ -2326,6 +2366,9 @@ function summarizeUpstreamError(error) {
 
 function shouldAttemptImapFallback(error) {
   const message = summarizeUpstreamError(error).toLowerCase();
+  if (isTransientSyncError(message)) {
+    return false;
+  }
   if (!message.startsWith("microsoft token refresh failed:")) {
     return true;
   }
@@ -2351,7 +2394,7 @@ function logInfo(event, detail) {
     JSON.stringify({
       level: "info",
       event,
-      ...redactSensitiveValue(detail),
+      ...maskLogEmails(redactSensitiveValue(detail)),
       at: new Date().toISOString(),
     }),
   );

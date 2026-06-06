@@ -13,7 +13,9 @@ const state = {
   sync: {},
   selectedMessage: null,
   detail: null,
+  detailLoadingId: null,
   stats: { total: 0 },
+  pagination: { page: 1, pageSize: 25 },
   filters: { accountId: "", folder: "", group: "", keyword: "" },
   drafts: {
     account: { email: "", groupName: "", clientId: "", refreshToken: "" },
@@ -215,12 +217,22 @@ function syncStatusInfo(account) {
   const rawStatus = account.last_sync_status || "idle";
   const transientError = rawStatus === "error" && isTransientSyncError(account.last_sync_error);
   const status = transientError ? "pending_retry" : rawStatus;
+  if (status === "idle") return { className: "status-dot", label: "未同步", errorPrefix: "提示" };
   if (status === "success") return { className: "status-dot success", label: "正常", errorPrefix: "提示" };
   if (status === "queued") return { className: "status-dot waiting", label: "已排队", errorPrefix: "提示" };
   if (status === "running") return { className: "status-dot waiting", label: "同步中", errorPrefix: "提示" };
   if (status === "pending_retry") return { className: "status-dot waiting", label: "等待重试", errorPrefix: "原因" };
   if (status === "error") return { className: "status-dot error", label: "异常", errorPrefix: "错误" };
   return { className: "status-dot", label: status, errorPrefix: "提示" };
+}
+
+function syncRunStatusInfo(status) {
+  if (status === "success") return { className: "status-dot success", label: "成功" };
+  if (status === "running") return { className: "status-dot waiting", label: "同步中" };
+  if (status === "queued") return { className: "status-dot waiting", label: "已排队" };
+  if (status === "pending_retry") return { className: "status-dot waiting", label: "等待重试" };
+  if (status === "error") return { className: "status-dot error", label: "失败" };
+  return { className: "status-dot", label: status || "未知" };
 }
 
 function classifySyncError(error) {
@@ -365,6 +377,7 @@ function captureUiState() {
 }
 
 function sanitizeFilters() {
+  const before = JSON.stringify(state.filters);
   const selectedAccount = activeAccount();
   if (state.filters.accountId && !selectedAccount) state.filters.accountId = "";
 
@@ -375,17 +388,49 @@ function sanitizeFilters() {
   });
   if (state.filters.group && groupNames.indexOf(state.filters.group) === -1) state.filters.group = "";
   if (selectedAccount) state.filters.group = normalizeAccountGroup(selectedAccount);
+  return before !== JSON.stringify(state.filters);
 }
 
 function dashboardParams() {
   const params = new URLSearchParams();
   if (state.filters.accountId) params.set("accountId", state.filters.accountId);
   if (state.filters.folder) params.set("folder", state.filters.folder);
-  if (state.filters.group) params.set("group", state.filters.group);
+  if (!state.filters.accountId && state.filters.group) params.set("group", state.filters.group);
   if (state.filters.keyword) params.set("keyword", state.filters.keyword);
-  params.set("page", "1");
-  params.set("pageSize", "25");
+  params.set("page", String(state.pagination.page));
+  params.set("pageSize", String(state.pagination.pageSize));
   return params;
+}
+
+function applyDashboardData(data) {
+  state.accounts = data.accounts || [];
+  state.groups = data.groups || [];
+  state.messages = data.messages && data.messages.items ? data.messages.items : [];
+  state.stats.total = data.messages ? data.messages.total || 0 : 0;
+  state.pagination.page = data.messages ? data.messages.page || state.pagination.page : state.pagination.page;
+  state.pagination.pageSize = data.messages ? data.messages.pageSize || state.pagination.pageSize : state.pagination.pageSize;
+  state.sync = data.sync || {};
+  const filtersChanged = sanitizeFilters();
+  const clampedPage = Math.min(totalMailPages(), Math.max(1, state.pagination.page));
+  const pageChanged = clampedPage !== state.pagination.page;
+  state.pagination.page = clampedPage;
+  return filtersChanged || pageChanged;
+}
+
+function resetMailPage() {
+  state.pagination.page = 1;
+}
+
+function totalMailPages() {
+  return Math.max(1, Math.ceil((state.stats.total || 0) / state.pagination.pageSize));
+}
+
+function setMailPage(page) {
+  const nextPage = Math.min(totalMailPages(), Math.max(1, Number(page) || 1));
+  if (nextPage === state.pagination.page) return;
+  state.pagination.page = nextPage;
+  state.activeView = "mail";
+  refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
 }
 
 async function refreshDashboard(options) {
@@ -401,17 +446,17 @@ async function refreshDashboard(options) {
   dashboardInFlight = (async function () {
     try {
       const data = await api("/api/dashboard?" + dashboardParams().toString(), { method: "GET" });
-      state.accounts = data.accounts || [];
-      state.groups = data.groups || [];
-      state.messages = data.messages && data.messages.items ? data.messages.items : [];
-      state.stats.total = data.messages ? data.messages.total || 0 : 0;
-      state.sync = data.sync || {};
-      sanitizeFilters();
+      const filtersChanged = applyDashboardData(data);
+      if (filtersChanged) {
+        const refreshed = await api("/api/dashboard?" + dashboardParams().toString(), { method: "GET" });
+        applyDashboardData(refreshed);
+      }
       reconcileSyncNotice();
 
       if (!state.messages.length) {
         state.selectedMessage = null;
         state.detail = null;
+        state.detailLoadingId = null;
       } else if (!selectedMessageRow()) {
         state.selectedMessage = state.messages[0].id;
         await loadMessageDetail(state.selectedMessage, { silent: true });
@@ -440,19 +485,31 @@ async function refreshDashboard(options) {
 }
 
 async function loadMessageDetail(messageId, options) {
-  state.selectedMessage = Number(messageId);
-  if (!options || !options.silent) render();
-  if (detailCache.has(Number(messageId))) {
-    state.detail = detailCache.get(Number(messageId));
+  const id = Number(messageId);
+  state.selectedMessage = id;
+  if (detailCache.has(id)) {
+    state.detail = detailCache.get(id);
+    state.detailLoadingId = null;
     render();
     mountMessageFrame();
     return;
   }
-  const detail = await api("/api/messages/" + encodeURIComponent(messageId), { method: "GET" });
-  state.detail = detail;
-  detailCache.set(Number(messageId), detail);
-  if (detailCache.size > 30) {
-    detailCache.delete(detailCache.keys().next().value);
+  state.detail = null;
+  state.detailLoadingId = id;
+  if (!options || !options.silent) render();
+  try {
+    const detail = await api("/api/messages/" + encodeURIComponent(messageId), { method: "GET" });
+    detailCache.set(id, detail);
+    if (detailCache.size > 30) {
+      detailCache.delete(detailCache.keys().next().value);
+    }
+    if (Number(state.selectedMessage) !== id) return;
+    state.detail = detail;
+  } catch (error) {
+    if (Number(state.selectedMessage) === id) state.detail = null;
+    throw error;
+  } finally {
+    if (Number(state.detailLoadingId) === id) state.detailLoadingId = null;
   }
   render();
   mountMessageFrame();
@@ -699,12 +756,22 @@ function handleBulkFileSelect(event) {
   reader.readAsText(file, "UTF-8");
 }
 
+function focusManagementTool(cardId, fieldSelector) {
+  setTimeout(function () {
+    const card = document.getElementById(cardId);
+    if (!card) return;
+    card.scrollIntoView({ block: "center", behavior: "smooth" });
+    const field = fieldSelector ? card.querySelector(fieldSelector) : null;
+    if (field) field.focus();
+  }, 0);
+}
+
 async function handleSyncAll() {
-  if (state.syncingAll) return;
+  if (state.syncingAll || state.autoSyncing) return;
   state.syncingAll = true;
   state.ui.syncNotice = {
     status: "queued",
-    message: "正在提交一批账号同步，完成后会自动刷新列表。",
+    message: "正在提交全部活跃账号同步，完成后会自动刷新列表。",
     at: Date.now()
   };
   render();
@@ -712,12 +779,12 @@ async function handleSyncAll() {
     const result = await api("/api/sync/run", { method: "POST", body: "{}" });
     state.ui.syncNotice = {
       status: result.queued ? "queued" : "idle",
-      message: result.queued ? "已提交 " + result.queued + " 个账号同步，通常 5-20 秒内看到结果。" : "当前没有需要同步的账号。",
+      message: result.queued ? "已提交 " + result.queued + " 个活跃账号同步，通常 5-20 秒内看到结果。" : "当前没有需要同步的活跃账号。",
       at: Date.now()
     };
     scheduleDashboardRefresh(1800);
     scheduleDashboardRefresh(8000);
-    showToast(result.queued ? "已提交后台同步，本批排队 " + result.queued + " 个账号" : "当前没有需要同步的账号");
+    showToast(result.queued ? "已提交后台同步，本批排队 " + result.queued + " 个活跃账号" : "当前没有需要同步的活跃账号");
   } catch (error) {
     state.ui.syncNotice = { status: "error", message: "同步提交失败：" + error.message, at: Date.now() };
     showToast(error.message, "error");
@@ -790,6 +857,7 @@ async function handleQuickSyncAccount() {
   state.activeView = "mail";
   state.filters.group = normalizeAccountGroup(selected);
   state.filters.accountId = String(selected.id);
+  resetMailPage();
   await handleSyncAccount(selected.id);
   refreshDashboard({ skipAutoSync: true, silent: true }).catch(function (error) {
     showToast(error.message, "error");
@@ -914,6 +982,7 @@ async function applyFilterControls(clearAccount) {
   state.filters.folder = document.getElementById("filter-folder").value;
   state.filters.group = document.getElementById("filter-group").value;
   state.filters.keyword = document.getElementById("filter-keyword").value.trim();
+  resetMailPage();
   state.activeView = "mail";
   await refreshDashboard({ skipAutoSync: true });
 }
@@ -932,6 +1001,7 @@ async function handleSelectGroup(groupName) {
   state.ui.accountStatusFilter = "";
   state.filters.group = groupName || "";
   state.filters.accountId = "";
+  resetMailPage();
   await refreshDashboard({ skipAutoSync: true });
 }
 
@@ -960,6 +1030,7 @@ function viewAccountMail(accountId) {
   state.filters.accountId = String(accountId);
   const account = activeAccount();
   state.filters.group = account ? normalizeAccountGroup(account) : "";
+  resetMailPage();
   refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
 }
 
@@ -974,6 +1045,7 @@ function viewAccountManagement(accountId) {
 
 function clearMailFilters() {
   state.filters = { accountId: "", folder: "", group: "", keyword: "" };
+  resetMailPage();
   state.activeView = "mail";
   refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
 }
@@ -984,6 +1056,7 @@ function handleEmptyAction(action) {
     state.ui.accountFormOpen = true;
     state.ui.bulkFormOpen = false;
     render();
+    focusManagementTool("account-form-card", "input, textarea");
     return;
   }
   if (action === "bulk-import") {
@@ -991,6 +1064,7 @@ function handleEmptyAction(action) {
     state.ui.accountFormOpen = false;
     state.ui.bulkFormOpen = true;
     render();
+    focusManagementTool("bulk-account-card", "textarea");
     return;
   }
   if (action === "clear-filters") {
@@ -1001,6 +1075,7 @@ function handleEmptyAction(action) {
     state.filters.group = "";
     state.filters.accountId = "";
     state.ui.accountStatusFilter = "";
+    resetMailPage();
     if (state.activeView === "mail") {
       refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
     } else {
@@ -1085,7 +1160,7 @@ function renderSidebar(groups) {
 }
 
 function renderTopbar(groupOptions, accountOptions, disabled) {
-  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
+  const syncAllDisabled = state.syncingAll || state.autoSyncing ? " disabled" : disabled;
   const quickSyncDisabled = state.syncingAccountId ? " disabled" : disabled;
   return ""
     + "<header class=\"app-topbar\">"
@@ -1098,7 +1173,7 @@ function renderTopbar(groupOptions, accountOptions, disabled) {
     + "  </form>"
     + "  <div class=\"topbar-actions\">"
     + "    <label class=\"quick-sync\"><span>同步邮箱</span><div><input id=\"quick-sync-email\" list=\"account-email-options\" value=\"" + escapeHtml(state.ui.quickSyncEmail || "") + "\" placeholder=\"输入邮箱，支持模糊匹配\"" + quickSyncDisabled + " /><datalist id=\"account-email-options\">" + state.accounts.map(function (account) { return "<option value=\"" + escapeHtml(account.email) + "\"></option>"; }).join("") + "</datalist><button class=\"btn primary\" data-quick-sync-account" + quickSyncDisabled + ">" + (state.syncingAccountId ? "同步中" : "同步并查看") + "</button></div></label>"
-    + "    <button class=\"btn text\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "排队中" : "同步一批账号") + "</button>"
+    + "    <button class=\"btn text\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "排队中" : "同步全部活跃账号") + "</button>"
     + "    <button class=\"btn text\" data-refresh-dashboard" + (state.loadingDashboard ? " disabled" : "") + ">刷新列表</button>"
     + "    <button class=\"btn text danger-text\" id=\"logout-btn\">退出</button>"
     + "  </div>"
@@ -1108,10 +1183,17 @@ function renderTopbar(groupOptions, accountOptions, disabled) {
 
 function renderMailWorkspace() {
   const resultLabel = state.stats.total || state.messages.length;
+  const page = state.pagination.page;
+  const pageSize = state.pagination.pageSize;
+  const pages = totalMailPages();
+  const pageStart = state.messages.length ? (page - 1) * pageSize + 1 : 0;
+  const pageEnd = state.messages.length ? pageStart + state.messages.length - 1 : 0;
+  const prevDisabled = page <= 1 || state.loadingDashboard ? " disabled" : "";
+  const nextDisabled = page >= pages || state.loadingDashboard ? " disabled" : "";
   return ""
     + "<main class=\"mail-workspace\">"
     + "  <section class=\"mail-list-pane\">"
-    + "    <div class=\"pane-head\"><div><h2>邮件列表</h2><p>当前结果 " + escapeHtml(String(state.messages.length)) + " / 匹配 " + escapeHtml(String(resultLabel)) + "</p></div></div>"
+    + "    <div class=\"pane-head\"><div><h2>邮件列表</h2><p>第 " + escapeHtml(String(page)) + " 页 · " + escapeHtml(String(pageStart)) + "-" + escapeHtml(String(pageEnd)) + " / 匹配 " + escapeHtml(String(resultLabel)) + "</p></div><div class=\"pane-actions\"><button class=\"link-btn\" data-mail-page=\"prev\"" + prevDisabled + ">上一页</button><button class=\"link-btn\" data-mail-page=\"next\"" + nextDisabled + ">下一页</button></div></div>"
     + "    <div class=\"mail-list\">" + (state.messages.map(renderMessage).join("") || renderMailEmpty()) + "</div>"
     + "  </section>"
     + "  <section class=\"mail-detail-pane\">"
@@ -1129,7 +1211,7 @@ function renderMailEmpty() {
   if (accountError) {
     return "<div class=\"empty\"><strong>" + escapeHtml(accountError.title) + "</strong><span>" + escapeHtml(accountError.hint) + "</span><div class=\"empty-actions\"><button class=\"btn primary\" data-sync-current>重新同步</button><button class=\"btn text\" data-view=\"sync\">查看同步记录</button><button class=\"btn text\" data-run-view-account=\"" + escapeHtml(account.id) + "\">查看账号</button></div></div>";
   }
-  return "<div class=\"empty\"><strong>没有匹配邮件</strong><span>" + (hasMailFilters() ? "当前筛选条件下没有归档邮件，可以清除筛选或同步当前账号。" : "当前还没有归档邮件，可以先同步账号。") + "</span><div class=\"empty-actions\">" + (hasMailFilters() ? "<button class=\"btn text\" data-empty-action=\"clear-filters\">清除筛选</button>" : "") + (account ? "<button class=\"btn primary\" data-sync-current>同步当前账号</button>" : "<button class=\"btn primary\" data-sync-all>同步一批账号</button>") + "</div></div>";
+  return "<div class=\"empty\"><strong>没有匹配邮件</strong><span>" + (hasMailFilters() ? "当前筛选条件下没有归档邮件，可以清除筛选或同步当前账号。" : "当前还没有归档邮件，可以先同步账号。") + "</span><div class=\"empty-actions\">" + (hasMailFilters() ? "<button class=\"btn text\" data-empty-action=\"clear-filters\">清除筛选</button>" : "") + (account ? "<button class=\"btn primary\" data-sync-current>同步当前账号</button>" : "<button class=\"btn primary\" data-sync-all>同步全部活跃账号</button>") + "</div></div>";
 }
 
 function renderMessage(message) {
@@ -1145,6 +1227,7 @@ function renderMessage(message) {
 
 function renderDetail() {
   const detail = state.detail;
+  if (state.detailLoadingId) return "<div class=\"empty detail-empty\"><strong>正在加载邮件</strong><span>正在读取正文、附件和元数据。</span></div>";
   if (!detail) return "<div class=\"empty detail-empty\">选择一封邮件后，这里会显示正文、附件和元数据。</div>";
   const code = extractVerificationCode(detail);
   const attachments = detail.attachments && detail.attachments.length
@@ -1170,23 +1253,23 @@ function renderDetail() {
 }
 
 function renderSyncWorkspace(disabled) {
-  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
+  const syncAllDisabled = state.syncingAll || state.autoSyncing ? " disabled" : disabled;
   return ""
     + "<main class=\"content-view\">"
-    + "  <div class=\"view-head\"><div><h2>同步记录</h2><p>最近同步任务、错误原因和归档数量。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button><button class=\"btn text\" data-load-sync-runs>刷新记录</button></div></div>"
+    + "  <div class=\"view-head\"><div><h2>同步记录</h2><p>最近同步任务、错误原因和归档数量。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "同步排队中" : "同步全部活跃账号") + "</button><button class=\"btn text\" data-load-sync-runs>刷新记录</button></div></div>"
     + "  <div class=\"sync-list\">" + (state.syncRuns.map(renderSyncRun).join("") || "<div class=\"empty\">暂无同步记录。</div>") + "</div>"
     + "</main>";
 }
 
 function renderSyncRun(run) {
-  const statusClass = run.status === "success" ? "success" : run.status === "running" ? "waiting" : "error";
+  const statusInfo = syncRunStatusInfo(run.status);
   const errorInfo = run.error_text ? classifySyncError(run.error_text) : null;
   const actions = run.account_id
     ? "<div class=\"row-actions\"><button class=\"link-btn\" data-run-view-mail=\"" + escapeHtml(run.account_id) + "\">查看邮件</button><button class=\"link-btn primary-link\" data-sync-account=\"" + escapeHtml(run.account_id) + "\">重试账号</button><button class=\"link-btn\" data-run-view-account=\"" + escapeHtml(run.account_id) + "\">查看账号</button></div>"
     : "";
   return ""
     + "<article class=\"sync-row\">"
-    + "  <div class=\"sync-row-main\"><div><strong>" + escapeHtml(run.account_email || "系统任务") + "</strong><span>" + escapeHtml(formatDate(run.started_at)) + " → " + escapeHtml(formatDate(run.finished_at)) + "</span></div><span class=\"status-label\"><span class=\"status-dot " + statusClass + "\"></span>" + escapeHtml(run.status) + "</span></div>"
+    + "  <div class=\"sync-row-main\"><div><strong>" + escapeHtml(run.account_email || "系统任务") + "</strong><span>" + escapeHtml(formatDate(run.started_at)) + " → " + escapeHtml(formatDate(run.finished_at)) + "</span></div><span class=\"status-label\"><span class=\"" + statusInfo.className + "\"></span>" + escapeHtml(statusInfo.label) + "</span></div>"
     + "  <div class=\"sync-row-meta\">邮件 " + escapeHtml(String(run.message_count || 0)) + " · 附件 " + escapeHtml(String(run.attachment_count || 0)) + " · " + escapeHtml(run.folder_scope || "-") + "</div>"
     + (errorInfo ? "<div class=\"sync-error\"><strong>" + escapeHtml(errorInfo.title) + "</strong><span>" + escapeHtml(errorInfo.hint) + "</span><details><summary>查看技术详情</summary><p>" + escapeHtml(run.error_text) + "</p></details></div>" : "")
     + actions
@@ -1194,7 +1277,7 @@ function renderSyncRun(run) {
 }
 
 function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, disabled) {
-  const syncAllDisabled = state.syncingAll ? " disabled" : disabled;
+  const syncAllDisabled = state.syncingAll || state.autoSyncing ? " disabled" : disabled;
   const accounts = managementAccounts();
   const groupLabel = state.filters.group ? " / " + state.filters.group : "";
   const filters = [
@@ -1207,7 +1290,7 @@ function renderAccountManagement(accountDraft, accountFormOpen, bulkFormOpen, di
   }).join("");
   return ""
     + "<main class=\"content-view\">"
-    + "  <div class=\"view-head\"><div><h2>账号管理" + escapeHtml(groupLabel) + "</h2><p>优先处理账号状态、异常重试和分组维护；添加/导入在列表下方。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll ? "同步排队中" : "同步一批账号") + "</button><button class=\"btn text\" data-empty-action=\"add-account\">添加账号</button></div></div>"
+    + "  <div class=\"view-head\"><div><h2>账号管理" + escapeHtml(groupLabel) + "</h2><p>优先处理账号状态、异常重试和分组维护；添加/导入在列表下方。</p></div><div class=\"view-actions\"><button class=\"btn primary\" data-sync-all" + syncAllDisabled + ">" + (state.syncingAll || state.autoSyncing ? "同步排队中" : "同步全部活跃账号") + "</button><button class=\"btn text\" data-empty-action=\"add-account\">添加账号</button></div></div>"
     + "  <div class=\"account-toolbar\"><span>筛选</span>" + filters + (state.filters.group ? "<button class=\"link-btn\" data-empty-action=\"clear-group\">查看全部分组</button>" : "") + "</div>"
     + "  <section class=\"account-manage-list\">" + (accounts.map(renderAccount).join("") || renderAccountEmpty()) + "</section>"
     + "  <section class=\"management-tools\">"
@@ -1346,6 +1429,12 @@ function bindEvents() {
   Array.from(document.querySelectorAll("[data-select-group]")).forEach(function (button) {
     button.onclick = function () { handleSelectGroup(button.getAttribute("data-select-group") || ""); };
   });
+  Array.from(document.querySelectorAll("[data-mail-page]")).forEach(function (button) {
+    button.onclick = function () {
+      const direction = button.getAttribute("data-mail-page");
+      setMailPage(state.pagination.page + (direction === "next" ? 1 : -1));
+    };
+  });
   Array.from(document.querySelectorAll("[data-account-filter]")).forEach(function (button) {
     button.onclick = function () {
       state.activeView = "settings";
@@ -1362,6 +1451,7 @@ function bindEvents() {
       state.filters.accountId = String(button.getAttribute("data-select-account"));
       const account = activeAccount();
       state.filters.group = account ? normalizeAccountGroup(account) : "";
+      resetMailPage();
       refreshDashboard({ skipAutoSync: true }).catch(function (error) { showToast(error.message, "error"); });
     };
   });

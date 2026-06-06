@@ -89,6 +89,15 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(79, 107, 237, 0.12);
 }
 
+.btn:focus-visible,
+.link-btn:focus-visible,
+.side-nav-item:focus-visible,
+.side-group:focus-visible,
+.mail-row:focus-visible {
+  outline: 2px solid rgba(79, 107, 237, 0.72);
+  outline-offset: 2px;
+}
+
 label {
   display: grid;
   gap: 6px;
@@ -310,6 +319,7 @@ label span {
 }
 
 .topbar-actions,
+.pane-actions,
 .view-actions,
 .detail-actions,
 .row-actions,
