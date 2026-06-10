@@ -32,10 +32,13 @@ ON mail_accounts(group_name);
 CREATE INDEX IF NOT EXISTS idx_mail_accounts_status_sync
 ON mail_accounts(status, last_sync_status, last_sync_at, updated_at);
 
+-- Messages are keyed per account: UNIQUE(account_id, graph_message_id) via
+-- idx_messages_account_message_key. Existing deployments created before this
+-- key existed must run docs/migrations/0002-message-key-rebuild.sql.
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id INTEGER NOT NULL,
-  graph_message_id TEXT NOT NULL UNIQUE,
+  graph_message_id TEXT NOT NULL,
   internet_message_id TEXT,
   folder TEXT NOT NULL,
   subject TEXT,
@@ -53,6 +56,9 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_message_key
+ON messages(account_id, graph_message_id);
 
 CREATE INDEX IF NOT EXISTS idx_messages_account_id
 ON messages(account_id);
@@ -115,3 +121,48 @@ ON sync_runs(started_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_sync_runs_account_started
 ON sync_runs(account_id, started_at DESC);
+
+-- Pre-aggregated message counts per (account, folder). The dashboard reads
+-- these instead of running COUNT(*) scans, keeping the D1 free-tier daily
+-- row-read budget intact under 24/7 UI polling.
+CREATE TABLE IF NOT EXISTS message_counters (
+  account_id INTEGER NOT NULL,
+  folder TEXT NOT NULL,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, folder)
+);
+
+CREATE TABLE IF NOT EXISTS login_throttle (
+  ip TEXT PRIMARY KEY,
+  window_started_at TEXT NOT NULL,
+  failure_count INTEGER NOT NULL DEFAULT 0,
+  last_failure_at TEXT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_messages_counter_insert
+AFTER INSERT ON messages
+BEGIN
+  INSERT INTO message_counters (account_id, folder, message_count)
+  VALUES (NEW.account_id, NEW.folder, 1)
+  ON CONFLICT(account_id, folder) DO UPDATE SET message_count = message_count + 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_messages_counter_delete
+AFTER DELETE ON messages
+BEGIN
+  UPDATE message_counters
+  SET message_count = CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+  WHERE account_id = OLD.account_id AND folder = OLD.folder;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_messages_counter_move
+AFTER UPDATE OF account_id, folder ON messages
+WHEN OLD.account_id != NEW.account_id OR OLD.folder != NEW.folder
+BEGIN
+  UPDATE message_counters
+  SET message_count = CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+  WHERE account_id = OLD.account_id AND folder = OLD.folder;
+  INSERT INTO message_counters (account_id, folder, message_count)
+  VALUES (NEW.account_id, NEW.folder, 1)
+  ON CONFLICT(account_id, folder) DO UPDATE SET message_count = message_count + 1;
+END;

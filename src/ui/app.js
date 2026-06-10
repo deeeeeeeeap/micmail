@@ -43,6 +43,8 @@ let dashboardQueuedOptions = null;
 const scheduledRefreshTimers = new Set();
 const detailCache = new Map();
 let modalReturnFocus = null;
+let lastRenderFingerprint = null;
+let lastMountedFrameKey = "";
 
 async function api(path, options) {
   const response = await fetch(path, Object.assign({
@@ -190,7 +192,8 @@ function isTransientSyncError(error) {
     "service unavailable",
     "503",
     "504",
-    "imap response did not complete"
+    "imap response did not complete",
+    "sync budget"
   ].some(function (pattern) {
     return message.indexOf(pattern) !== -1;
   });
@@ -466,7 +469,8 @@ async function refreshDashboard(options) {
       if (!requestedOptions.skipAutoSync) maybeAutoSync();
     } finally {
       state.loadingDashboard = false;
-      render();
+      const skipRender = Boolean(requestedOptions.silent) && shouldSkipSilentRender();
+      if (!skipRender) render();
     }
   })();
 
@@ -527,19 +531,25 @@ async function loadSyncRuns(options) {
 function mountMessageFrame() {
   const frame = document.getElementById("mail-frame");
   if (!frame || !state.detail) return;
+  const frameKey = String(state.detail.id);
+  if (frameKey === lastMountedFrameKey) return;
   const content = state.detail.body_content_type === "html"
     ? state.detail.body_html || ""
     : "<pre style=\"white-space:pre-wrap;font-family:inherit\">" + escapeHtml(state.detail.body_text || "") + "</pre>";
   frame.srcdoc = content;
+  lastMountedFrameKey = frameKey;
 }
+
+var AUTO_REFRESH_INTERVAL_MS = 180000;
 
 function startAutoRefresh() {
   if (autoRefreshTimer) return;
   autoRefreshTimer = setInterval(function () {
-    refreshDashboard({ skipAutoSync: true }).catch(function (error) {
+    if (document.visibilityState === "hidden") return;
+    refreshDashboard({ skipAutoSync: true, silent: true }).catch(function (error) {
       console.warn("auto refresh failed", error);
     });
-  }, 30000);
+  }, AUTO_REFRESH_INTERVAL_MS);
 }
 
 function stopAutoRefresh() {
@@ -578,8 +588,18 @@ async function maybeAutoSync() {
   }
 }
 
+function bindVisibilityRefresh() {
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible" || !state.authenticated) return;
+    refreshDashboard({ skipAutoSync: true, silent: true }).catch(function (error) {
+      console.warn("visibility refresh failed", error);
+    });
+  });
+}
+
 async function bootstrap() {
   render();
+  bindVisibilityRefresh();
   try {
     const session = await api("/api/auth/session", { method: "GET" });
     state.authenticated = !!session.authenticated;
@@ -1356,8 +1376,75 @@ function renderModal() {
     + "<div class=\"modal-backdrop\"><div class=\"modal-card\" role=\"dialog\" aria-modal=\"true\" aria-labelledby=\"modal-title\" tabindex=\"-1\"><h3 id=\"modal-title\">" + escapeHtml(modal.title || "确认操作") + "</h3><p>" + escapeHtml(modal.description || "") + "</p>" + input + "<div class=\"actions\"><button class=\"btn text\" data-modal-cancel>取消</button><button class=\"btn " + (modal.danger ? "danger" : "primary") + "\" data-modal-confirm>" + escapeHtml(modal.confirmText || "确认") + "</button></div></div></div>";
 }
 
+function computeRenderFingerprint() {
+  // 只收集会影响 DOM 输出的状态；drafts 故意不参与指纹，
+  // 这样用户在表单里输入时静默轮询不会强制重建 DOM 把焦点打断。
+  return JSON.stringify({
+    checking: state.checking,
+    authenticated: state.authenticated,
+    busy: state.busy,
+    loadingDashboard: state.loadingDashboard,
+    autoSyncing: state.autoSyncing,
+    syncingAll: state.syncingAll,
+    syncingAccountId: state.syncingAccountId,
+    activeView: state.activeView,
+    accounts: state.accounts.map(function (account) {
+      return {
+        id: account.id,
+        email: account.email,
+        group_name: account.group_name,
+        status: account.status,
+        last_sync_status: account.last_sync_status,
+        last_sync_error: account.last_sync_error,
+        last_sync_at: account.last_sync_at,
+        client_id: account.client_id,
+        updated_at: account.updated_at
+      };
+    }),
+    groups: state.groups,
+    messages: state.messages.map(function (message) {
+      return {
+        id: message.id,
+        subject: message.subject,
+        preview: message.preview,
+        from_name: message.from_name,
+        from_address: message.from_address,
+        account_email: message.account_email,
+        folder: message.folder,
+        received_at: message.received_at,
+        is_read: message.is_read
+      };
+    }),
+    sync: state.sync,
+    total: state.stats.total,
+    pagination: state.pagination,
+    filters: state.filters,
+    selectedMessage: state.selectedMessage,
+    detailId: state.detail ? state.detail.id : null,
+    detailIsRead: state.detail ? state.detail.is_read : null,
+    detailLoadingId: state.detailLoadingId,
+    syncRuns: state.syncRuns,
+    toast: state.toast,
+    hasModal: Boolean(state.modal),
+    ui: {
+      accountStatusFilter: state.ui.accountStatusFilter,
+      quickSyncEmail: state.ui.quickSyncEmail,
+      accountFormOpen: state.ui.accountFormOpen,
+      bulkFormOpen: state.ui.bulkFormOpen,
+      // 用 currentSyncNotice() 而不是原始 syncNotice：提示超时消失也属于 DOM 变化。
+      syncNotice: currentSyncNotice()
+    }
+  });
+}
+
+function shouldSkipSilentRender() {
+  return lastRenderFingerprint !== null && computeRenderFingerprint() === lastRenderFingerprint;
+}
+
 function render() {
   captureUiState();
+  // innerHTML 即将整体重建，iframe 是新元素，必须允许重新挂载。
+  lastMountedFrameKey = "";
   const app = document.getElementById("app");
   if (state.checking) {
     app.innerHTML = "<main class=\"login-shell\"><section class=\"login-panel\"><div class=\"login-brand\"><div class=\"brand-mark\">M</div><div><h1>MicMail</h1><p>正在检查登录状态</p></div></div><p class=\"muted\">请稍候，正在连接 Worker API。</p></section></main>" + renderToast();
@@ -1368,6 +1455,7 @@ function render() {
     mountMessageFrame();
   }
   bindEvents();
+  lastRenderFingerprint = computeRenderFingerprint();
 }
 
 function bindEvents() {

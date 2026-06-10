@@ -8,37 +8,87 @@ import {
   requireString,
   securityHeaders,
 } from "./lib/http.js";
-import { ensureSchema } from "./lib/schema.js";
+import { ensureSchema, getMessageKeyMode, invalidateMessageKeyMode } from "./lib/schema.js";
 import {
-  base64ToUint8,
   decryptText as decryptSecretText,
   encryptText as encryptSecretText,
 } from "./lib/crypto.js";
+import { makeAttachmentContentDisposition } from "./lib/safety.js";
 import {
-  makeAttachmentContentDisposition,
-  redactSensitiveText,
-  redactSensitiveValue,
-} from "./lib/safety.js";
-import { connect } from "cloudflare:sockets";
+  addDays,
+  addHours,
+  chunkArray,
+  clampInt,
+  constantTimeStringEquals,
+  logInfo,
+  mapWithConcurrency,
+  minutesAgoIso,
+  parseJsonObject,
+  randomHex,
+  sha256Hex,
+  summarizeUpstreamError,
+} from "./lib/util.js";
+import {
+  EXPIRED_ARCHIVE_CLEANUP_LIMIT,
+  getFanoutConcurrency,
+  getImapBodyPeekBytes,
+  getImapCommandTimeoutSeconds,
+  getImapFetchBatchSize,
+  getImapFetchMaxResponseBytes,
+  getImapIdleTimeoutSeconds,
+  getLoginMaxFailures,
+  getLoginWindowMinutes,
+  getMaxSyncAccountsPerRun,
+  getMaxSyncPages,
+  getPublicBaseUrl,
+  getQueuedStaleMinutes,
+  getRetentionDays,
+  getRunningStaleMinutes,
+  getSessionTtlHours,
+  getSyncConcurrency,
+  getSyncFolders,
+  getSyncOpsBudget,
+  getSyncPageSize,
+  getSyncPolicy,
+  getSyncRunRetentionDays,
+  DEFAULT_IMAP_BASE_RESPONSE_BYTES,
+} from "./lib/config.js";
+import {
+  isFreshSyncInProgress,
+  isTransientSyncError,
+  shouldAttemptImapFallback,
+  shouldAutoSyncAccount,
+  summarizeSyncFailure,
+} from "./lib/sync-policy.js";
+import { evaluateLoginThrottle, loginThrottleWindowCutoff } from "./lib/throttle.js";
+import {
+  buildDeltaUrl,
+  graphFetchArrayBuffer,
+  graphFetchJson,
+  refreshAccessToken,
+  refreshImapAccessToken,
+  verifyMicrosoftAccount,
+} from "./lib/graph.js";
+import { createImapClient, selectImapMailbox } from "./lib/imap.js";
+import {
+  extractImapLiteralBodies,
+  formatImapSearchDate,
+  makeXoauth2Token,
+  parseImapSearchUids,
+} from "./lib/imap-parse.js";
+import { parseRawEmailToGraphLikeItem } from "./lib/mime.js";
+import {
+  buildInPlaceholders,
+  buildMessageUpsertParams,
+  buildMessagesPayload,
+  buildMessagesQueryPlan,
+  extractBatchReturnedIds,
+  messageUpsertSqlForMode,
+} from "./lib/db-batch.js";
+
 const SESSION_COOKIE = "mail_admin_session";
-const DEFAULT_SESSION_TTL_HOURS = 12;
-const DEFAULT_RETENTION_DAYS = 90;
-const DEFAULT_SYNC_PAGE_SIZE = 50;
-const DEFAULT_MAX_SYNC_PAGES = 40;
-const DEFAULT_SYNC_FOLDERS = ["inbox", "junkemail"];
-const DEFAULT_AUTO_SYNC_STALE_MINUTES = 30;
-const DEFAULT_TRANSIENT_RETRY_MINUTES = 10;
-const DEFAULT_QUEUED_STALE_MINUTES = 10;
-const DEFAULT_RUNNING_STALE_MINUTES = 60;
-const DEFAULT_MAX_SYNC_ACCOUNTS_PER_RUN = 8;
-const DEFAULT_SYNC_RUN_RETENTION_DAYS = 14;
-const DEFAULT_IMAP_FETCH_BATCH_SIZE = 1;
-const DEFAULT_IMAP_BODY_PEEK_BYTES = 2 * 1024 * 1024;
-const DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS = 60;
-const DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS = 30;
-const EXPIRED_ARCHIVE_CLEANUP_LIMIT = 100;
-const DEFAULT_IMAP_BASE_RESPONSE_BYTES = 512 * 1024;
-const encoder = new TextEncoder();
+const R2_DELETE_CONCURRENCY = 6;
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -76,8 +126,6 @@ async function handleRequest(request, env, ctx) {
     return new Response(null, { status: 204 });
   }
 
-  await ensureSchema(env);
-
   if (path === "/api/health" && request.method === "GET") {
     return jsonResponse({
       success: true,
@@ -87,6 +135,8 @@ async function handleRequest(request, env, ctx) {
       },
     });
   }
+
+  await ensureSchema(env);
 
   if (path === "/api/auth/login" && request.method === "POST") {
     return await loginRoute(request, env);
@@ -98,6 +148,10 @@ async function handleRequest(request, env, ctx) {
 
   if (path === "/api/auth/session" && request.method === "GET") {
     return await sessionRoute(request, env);
+  }
+
+  if (path === "/api/internal/sync/account" && request.method === "POST") {
+    return await internalSyncRoute(request, env);
   }
 
   if (!path.startsWith("/api/")) {
@@ -119,11 +173,11 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (path === "/api/sync/run" && request.method === "POST") {
-    return await syncAllAccountsRoute(env, ctx);
+    return await syncAllAccountsRoute(url, env, ctx);
   }
 
   if (path === "/api/sync/auto" && request.method === "POST") {
-    return await syncAutoAccountsRoute(env, ctx);
+    return await syncAutoAccountsRoute(url, env, ctx);
   }
 
   if (path === "/api/sync/runs" && request.method === "GET") {
@@ -186,9 +240,31 @@ async function loginRoute(request, env) {
     throw new HttpError(500, "ADMIN_PASSWORD is not configured.");
   }
 
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  const now = new Date();
+  const throttleOptions = {
+    maxFailures: getLoginMaxFailures(env),
+    windowMinutes: getLoginWindowMinutes(env),
+  };
+  const throttleRow = await env.DB.prepare(
+    "SELECT window_started_at, failure_count FROM login_throttle WHERE ip = ?",
+  )
+    .bind(ip)
+    .first();
+  const throttle = evaluateLoginThrottle(throttleRow, now, throttleOptions);
+  if (throttle.blocked) {
+    throw new HttpError(
+      429,
+      "Too many failed login attempts. Try again in about " + throttle.retryAfterMinutes + " minute(s).",
+    );
+  }
+
   if (!(await constantTimeStringEquals(password, env.ADMIN_PASSWORD))) {
+    await recordLoginFailure(env, ip, now, throttleOptions.windowMinutes);
     throw new HttpError(401, "Invalid password.");
   }
+
+  await env.DB.prepare("DELETE FROM login_throttle WHERE ip = ?").bind(ip).run();
 
   const sessionToken = randomHex(32);
   const tokenHash = await getSessionHash(sessionToken, env);
@@ -215,6 +291,27 @@ async function loginRoute(request, env) {
       "Set-Cookie": buildSessionCookie(sessionToken, getSessionTtlHours(env)),
     },
   );
+}
+
+async function recordLoginFailure(env, ip, now, windowMinutes) {
+  const nowIso = now.toISOString();
+  const cutoff = loginThrottleWindowCutoff(now, windowMinutes);
+  await env.DB.prepare(
+    `INSERT INTO login_throttle (ip, window_started_at, failure_count, last_failure_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(ip) DO UPDATE SET
+       failure_count = CASE
+         WHEN login_throttle.window_started_at <= ? THEN 1
+         ELSE login_throttle.failure_count + 1
+       END,
+       window_started_at = CASE
+         WHEN login_throttle.window_started_at <= ? THEN excluded.window_started_at
+         ELSE login_throttle.window_started_at
+       END,
+       last_failure_at = excluded.last_failure_at`,
+  )
+    .bind(ip, nowIso, nowIso, cutoff, cutoff)
+    .run();
 }
 
 async function logoutRoute(request, env) {
@@ -257,14 +354,21 @@ async function listAccountsRoute(env) {
   });
 }
 
-async function listAccountsData(env) {
-  const result = await env.DB.prepare(
-    `SELECT id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error,
+const ACCOUNTS_LIST_SQL = `SELECT id, email, client_id, group_name, status, last_sync_at, last_sync_status, last_sync_error,
             created_at, updated_at
      FROM mail_accounts
-     ORDER BY updated_at DESC, id DESC`,
-  ).all();
+     ORDER BY updated_at DESC, id DESC`;
 
+const SYNC_SUMMARY_SQL = `SELECT
+       SUM(CASE WHEN last_sync_status = 'success' THEN 1 ELSE 0 END) AS success_count,
+       SUM(CASE WHEN last_sync_status IN ('queued', 'running') THEN 1 ELSE 0 END) AS active_count,
+       SUM(CASE WHEN last_sync_status IN ('pending_retry', 'error') THEN 1 ELSE 0 END) AS attention_count,
+       MAX(last_sync_at) AS latest_sync_at
+     FROM mail_accounts
+     WHERE status = 'active'`;
+
+async function listAccountsData(env) {
+  const result = await env.DB.prepare(ACCOUNTS_LIST_SQL).all();
   return result.results ?? [];
 }
 
@@ -374,13 +478,20 @@ async function updateAccountRoute(request, env, accountId) {
   }
 
   const now = new Date().toISOString();
-  await env.DB.prepare(
-    `UPDATE mail_accounts
-     SET email = ?, client_id = ?, refresh_token_encrypted = ?, group_name = ?, status = ?, updated_at = ?
-     WHERE id = ?`,
-  )
-    .bind(email, clientId, encryptedRefreshToken, groupName, status, now, accountId)
-    .run();
+  try {
+    await env.DB.prepare(
+      `UPDATE mail_accounts
+       SET email = ?, client_id = ?, refresh_token_encrypted = ?, group_name = ?, status = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+      .bind(email, clientId, encryptedRefreshToken, groupName, status, now, accountId)
+      .run();
+  } catch (error) {
+    if (/UNIQUE constraint failed/i.test(String(error?.message || error))) {
+      throw new HttpError(409, "Another account already uses this email.");
+    }
+    throw error;
+  }
 
   return jsonResponse({
     success: true,
@@ -394,9 +505,10 @@ async function deleteAccountRoute(env, accountId) {
     throw new HttpError(404, "Account not found.");
   }
 
-  await purgeAccountArchive(env, accountId);
-  await env.DB.prepare("DELETE FROM sync_runs WHERE account_id = ?").bind(accountId).run();
-  await env.DB.prepare("DELETE FROM mail_accounts WHERE id = ?").bind(accountId).run();
+  await purgeAccountArchive(env, accountId, [
+    env.DB.prepare("DELETE FROM sync_runs WHERE account_id = ?").bind(accountId),
+    env.DB.prepare("DELETE FROM mail_accounts WHERE id = ?").bind(accountId),
+  ]);
 
   return jsonResponse({
     success: true,
@@ -414,7 +526,7 @@ async function syncSingleAccountRoute(env, accountId, ctx) {
     throw new HttpError(400, "Account is inactive and cannot be synced.");
   }
 
-  if (isFreshSyncInProgress(env, account, new Date())) {
+  if (isFreshSyncInProgress(account, new Date(), getSyncPolicy(env))) {
     return jsonResponse({
       success: true,
       data: {
@@ -457,10 +569,12 @@ async function syncSingleAccountRoute(env, accountId, ctx) {
   return jsonResponse({ success: true, data: result });
 }
 
-async function syncAllAccountsRoute(env, ctx) {
-  const urlStartedAt = new Date().toISOString();
+async function syncAllAccountsRoute(url, env, ctx) {
+  const startedAt = new Date().toISOString();
   const accounts = await claimManualSyncAccounts(env);
-  const task = syncAccounts(env, accounts, getSyncConcurrency(env));
+  const baseUrl = getPublicBaseUrl(env) || url.origin;
+  const task = runSyncBatch(env, accounts, baseUrl, getSyncConcurrency(env));
+
   if (ctx?.waitUntil) {
     ctx.waitUntil(task);
     return jsonResponse({
@@ -469,7 +583,7 @@ async function syncAllAccountsRoute(env, ctx) {
         status: "started",
         queued: accounts.length,
         batchLimit: getMaxSyncAccountsPerRun(env),
-        startedAt: urlStartedAt,
+        startedAt,
         message: accounts.length
           ? "Sync batch is running in the background."
           : "No account is available for sync right now.",
@@ -488,10 +602,11 @@ async function syncAllAccountsRoute(env, ctx) {
   });
 }
 
-async function syncAutoAccountsRoute(env, ctx) {
+async function syncAutoAccountsRoute(url, env, ctx) {
   const startedAt = new Date().toISOString();
   const accounts = await claimAutoSyncAccounts(env);
-  const task = syncAccounts(env, accounts, 1);
+  const baseUrl = getPublicBaseUrl(env) || url.origin;
+  const task = runSyncBatch(env, accounts, baseUrl, 1);
 
   if (ctx?.waitUntil) {
     ctx.waitUntil(task);
@@ -512,6 +627,95 @@ async function syncAutoAccountsRoute(env, ctx) {
   return jsonResponse({ success: true, data: { queued: accounts.length, results } });
 }
 
+async function internalSyncRoute(request, env) {
+  const provided = request.headers.get("x-micmail-internal") || "";
+  const expected = await internalSyncToken(env);
+  if (!provided || !(await constantTimeStringEquals(provided, expected))) {
+    throw new HttpError(401, "Authentication required.");
+  }
+
+  const body = await readJson(request);
+  const accountId = Number(body.accountId);
+  if (!Number.isInteger(accountId) || accountId < 1) {
+    throw new HttpError(400, "Invalid accountId.");
+  }
+
+  const account = await getAccountById(env, accountId, true);
+  if (!account) {
+    throw new HttpError(404, "Account not found.");
+  }
+  if (account.status !== "active" || account.last_sync_status !== "queued") {
+    return jsonResponse({
+      success: true,
+      data: { accountId, skipped: true, status: account.last_sync_status },
+    });
+  }
+
+  const result = await syncAccount(env, account);
+  return jsonResponse({ success: true, data: result });
+}
+
+async function internalSyncToken(env) {
+  if (!env.SESSION_SECRET) {
+    throw new HttpError(500, "SESSION_SECRET is not configured.");
+  }
+  return await sha256Hex(env.SESSION_SECRET + ":internal-sync:v1");
+}
+
+/**
+ * Runs a claimed batch either by fanning each account out to its own Worker
+ * invocation (fresh subrequest budget per account, required on the free plan)
+ * or inline when no base URL is available.
+ */
+async function runSyncBatch(env, accounts, baseUrl, inlineConcurrency) {
+  if (!accounts.length) {
+    return [];
+  }
+  if (baseUrl && accounts.length > 1) {
+    await dispatchSyncFanout(env, accounts, baseUrl);
+    return accounts.map((account) => ({
+      accountId: account.id,
+      email: account.email,
+      status: "dispatched",
+    }));
+  }
+  // Inline batches share one ops budget: the whole batch runs inside a single
+  // Worker invocation, so per-account budgets would multiply past the free-tier
+  // subrequest limit. Accounts cut off by the shared budget end up in
+  // pending_retry and continue on the next run.
+  const sharedBudget = { remaining: getSyncOpsBudget(env) };
+  return await syncAccounts(env, accounts, inlineConcurrency, sharedBudget);
+}
+
+async function dispatchSyncFanout(env, accounts, baseUrl) {
+  const token = await internalSyncToken(env);
+  await mapWithConcurrency(accounts, getFanoutConcurrency(env), async (account) => {
+    try {
+      const response = await fetch(baseUrl + "/api/internal/sync/account", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-micmail-internal": token,
+        },
+        body: JSON.stringify({ accountId: account.id }),
+      });
+      if (!response.ok) {
+        logInfo("sync_fanout_child_failed", {
+          accountId: account.id,
+          email: account.email,
+          status: response.status,
+        });
+      }
+    } catch (error) {
+      logInfo("sync_fanout_child_failed", {
+        accountId: account.id,
+        email: account.email,
+        error: summarizeUpstreamError(error),
+      });
+    }
+  });
+}
+
 async function listMessagesRoute(url, env) {
   return jsonResponse({
     success: true,
@@ -520,116 +724,36 @@ async function listMessagesRoute(url, env) {
 }
 
 async function dashboardRoute(url, env) {
-  const [accounts, messages, syncSummary] = await Promise.all([
-    listAccountsData(env),
-    listMessagesData(url, env),
-    getSyncSummary(env),
+  const plan = buildMessagesQueryPlan(url);
+  // All dashboard reads share one batch: 1 D1 subrequest per poll instead of 4-5.
+  const [accountsResult, totalResult, itemsResult, summaryResult] = await env.DB.batch([
+    env.DB.prepare(ACCOUNTS_LIST_SQL),
+    env.DB.prepare(plan.total.sql).bind(...plan.total.params),
+    env.DB.prepare(plan.items.sql).bind(...plan.items.params),
+    env.DB.prepare(SYNC_SUMMARY_SQL),
   ]);
+  const accounts = accountsResult.results ?? [];
 
   return jsonResponse({
     success: true,
     data: {
       accounts,
       groups: buildGroupSummaries(accounts),
-      messages,
-      sync: syncSummary,
+      messages: buildMessagesPayload(plan, totalResult, itemsResult),
+      sync: mapSyncSummaryRow(summaryResult.results?.[0]),
       serverTime: new Date().toISOString(),
     },
   });
 }
 
 async function listMessagesData(url, env) {
-  const page = clampInt(url.searchParams.get("page"), 1, 1, 100000);
-  const pageSize = clampInt(url.searchParams.get("pageSize"), 25, 1, 100);
-  const offset = (page - 1) * pageSize;
-  const filters = [];
-  const params = [];
-
-  const accountId = url.searchParams.get("accountId");
-  if (accountId) {
-    const parsedAccountId = Number(accountId);
-    if (!Number.isInteger(parsedAccountId) || parsedAccountId < 1) {
-      throw new HttpError(400, "Invalid accountId.");
-    }
-    filters.push("m.account_id = ?");
-    params.push(parsedAccountId);
-  }
-
-  const folder = url.searchParams.get("folder");
-  if (folder) {
-    filters.push("m.folder = ?");
-    params.push(folder);
-  }
-
-  const groupName = url.searchParams.get("group");
-  if (groupName) {
-    filters.push("a.group_name = ?");
-    params.push(groupName);
-  }
-
-  const keyword = (url.searchParams.get("keyword") || "").trim();
-  if (keyword) {
-    const like = "%" + keyword + "%";
-    const searchBody = url.searchParams.get("searchBody") === "1";
-    filters.push(searchBody
-      ? "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ? OR m.body_text LIKE ?)"
-      : "(m.subject LIKE ? OR m.from_name LIKE ? OR m.from_address LIKE ?)");
-    params.push(like, like, like);
-    if (searchBody) {
-      params.push(like);
-    }
-  }
-
-  const dateFrom = url.searchParams.get("dateFrom");
-  if (dateFrom) {
-    filters.push("m.received_at >= ?");
-    params.push(dateFrom);
-  }
-
-  const dateTo = url.searchParams.get("dateTo");
-  if (dateTo) {
-    filters.push("m.received_at <= ?");
-    params.push(dateTo);
-  }
-
-  const whereClause = filters.length ? "WHERE " + filters.join(" AND ") : "";
-  const totalRow = await env.DB.prepare(
-    `SELECT COUNT(*) AS total
-     FROM messages m
-     JOIN mail_accounts a ON a.id = m.account_id
-     ${whereClause}`,
-  )
-    .bind(...params)
-    .first();
-
-  const rows = await env.DB.prepare(
-    `SELECT
-       m.id,
-       m.account_id,
-       a.email AS account_email,
-       m.folder,
-       m.subject,
-       m.from_name,
-       m.from_address,
-       m.received_at,
-       m.is_read,
-       m.has_attachments,
-       substr(coalesce(m.body_text, ''), 1, 180) AS preview
-     FROM messages m
-     JOIN mail_accounts a ON a.id = m.account_id
-     ${whereClause}
-     ORDER BY m.received_at DESC, m.id DESC
-     LIMIT ? OFFSET ?`,
-  )
-    .bind(...params, pageSize, offset)
-    .all();
-
-  return {
-    page,
-    pageSize,
-    total: totalRow?.total ?? 0,
-    items: rows.results ?? [],
-  };
+  const plan = buildMessagesQueryPlan(url);
+  // Total + page rows in one batch: 1 D1 subrequest instead of 2.
+  const [totalResult, itemsResult] = await env.DB.batch([
+    env.DB.prepare(plan.total.sql).bind(...plan.total.params),
+    env.DB.prepare(plan.items.sql).bind(...plan.items.params),
+  ]);
+  return buildMessagesPayload(plan, totalResult, itemsResult);
 }
 
 async function listSyncRunsRoute(url, env) {
@@ -674,17 +798,7 @@ async function listSyncRunsRoute(url, env) {
   });
 }
 
-async function getSyncSummary(env) {
-  const row = await env.DB.prepare(
-    `SELECT
-       SUM(CASE WHEN last_sync_status = 'success' THEN 1 ELSE 0 END) AS success_count,
-       SUM(CASE WHEN last_sync_status IN ('queued', 'running') THEN 1 ELSE 0 END) AS active_count,
-       SUM(CASE WHEN last_sync_status IN ('pending_retry', 'error') THEN 1 ELSE 0 END) AS attention_count,
-       MAX(last_sync_at) AS latest_sync_at
-     FROM mail_accounts
-     WHERE status = 'active'`,
-  ).first();
-
+function mapSyncSummaryRow(row) {
   return {
     successCount: Number(row?.success_count || 0),
     activeCount: Number(row?.active_count || 0),
@@ -790,16 +904,60 @@ async function downloadAttachmentRoute(env, messageId, attachmentId) {
 
 async function runScheduledMaintenance(env, cron) {
   logInfo("scheduled_start", { cron });
-  await cleanupExpiredSessions(env);
+  await runMaintenanceSqlBatch(env);
   await cleanupExpiredArchive(env);
-  await cleanupStaleSyncRuns(env);
-  await cleanupOldSyncRuns(env);
   await syncAutoAccounts(env);
   logInfo("scheduled_complete", { cron });
 }
 
+async function runMaintenanceSqlBatch(env) {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const queuedStaleBefore = minutesAgoIso(now, getQueuedStaleMinutes(env));
+  const runningStaleBefore = minutesAgoIso(now, getRunningStaleMinutes(env));
+  // All pure-SQL cleanups in one batch: 1 subrequest, applied atomically.
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM admin_sessions WHERE expires_at <= ?").bind(nowIso),
+    env.DB.prepare("DELETE FROM login_throttle WHERE last_failure_at <= ?").bind(
+      minutesAgoIso(now, 24 * 60),
+    ),
+    env.DB.prepare(
+      `UPDATE sync_runs
+       SET status = 'error',
+           finished_at = ?,
+           error_text = 'Sync run marked stale after timeout.'
+       WHERE status = 'running'
+         AND started_at <= ?
+         AND finished_at IS NULL`,
+    ).bind(nowIso, runningStaleBefore),
+    env.DB.prepare(
+      `UPDATE mail_accounts
+       SET last_sync_status = 'pending_retry',
+           last_sync_error = 'Sync state marked stale after queued timeout.',
+           updated_at = ?
+       WHERE status = 'active'
+         AND last_sync_status = 'queued'
+         AND updated_at <= ?`,
+    ).bind(nowIso, queuedStaleBefore),
+    env.DB.prepare(
+      `UPDATE mail_accounts
+       SET last_sync_status = 'pending_retry',
+           last_sync_error = 'Sync state marked stale after running timeout.',
+           updated_at = ?
+       WHERE status = 'active'
+         AND last_sync_status = 'running'
+         AND updated_at <= ?`,
+    ).bind(nowIso, runningStaleBefore),
+    env.DB.prepare("DELETE FROM sync_runs WHERE started_at <= ? AND status != 'running'").bind(
+      addDays(now, -getSyncRunRetentionDays(env)).toISOString(),
+    ),
+  ]);
+}
+
 async function syncAutoAccounts(env) {
-  return await syncAccounts(env, await claimAutoSyncAccounts(env), 1);
+  const accounts = await claimAutoSyncAccounts(env);
+  const baseUrl = getPublicBaseUrl(env);
+  return await runSyncBatch(env, accounts, baseUrl, 1);
 }
 
 async function getActiveAccounts(env) {
@@ -817,8 +975,9 @@ async function getActiveAccounts(env) {
 
 async function getManualSyncAccounts(env) {
   const now = new Date();
+  const policy = getSyncPolicy(env);
   const accounts = await getActiveAccounts(env);
-  return accounts.filter((account) => !isFreshSyncInProgress(env, account, now));
+  return accounts.filter((account) => !isFreshSyncInProgress(account, now, policy));
 }
 
 async function claimManualSyncAccounts(env) {
@@ -829,12 +988,13 @@ async function claimManualSyncAccounts(env) {
 
 async function claimAutoSyncAccounts(env) {
   const now = new Date();
+  const policy = getSyncPolicy(env);
   const maxAccounts = getMaxSyncAccountsPerRun(env);
   const candidates = await getActiveAccounts(env);
 
   return await claimSyncAccounts(
     env,
-    candidates.filter((account) => shouldAutoSyncAccount(env, account, now)),
+    candidates.filter((account) => shouldAutoSyncAccount(account, now, policy)),
     maxAccounts,
   );
 }
@@ -844,15 +1004,7 @@ async function claimSyncAccounts(env, candidates, maxAccounts) {
   const nowIso = now.toISOString();
   const queuedStaleBefore = minutesAgoIso(now, getQueuedStaleMinutes(env));
   const runningStaleBefore = minutesAgoIso(now, getRunningStaleMinutes(env));
-  const claimed = [];
-
-  for (const account of candidates) {
-    if (claimed.length >= maxAccounts) {
-      break;
-    }
-
-    const result = await env.DB.prepare(
-      `UPDATE mail_accounts
+  const claimSql = `UPDATE mail_accounts
        SET last_sync_status = 'queued', updated_at = ?
        WHERE id = ?
          AND status = 'active'
@@ -860,63 +1012,40 @@ async function claimSyncAccounts(env, candidates, maxAccounts) {
            last_sync_status NOT IN ('running', 'queued')
            OR (last_sync_status = 'queued' AND updated_at <= ?)
            OR (last_sync_status = 'running' AND updated_at <= ?)
-         )`,
-    )
-      .bind(nowIso, account.id, queuedStaleBefore, runningStaleBefore)
-      .run();
+         )`;
+  const claimed = [];
+  let cursor = 0;
 
-    if (result.meta?.changes) {
-      claimed.push({ ...account, last_sync_status: "queued" });
-    }
+  // The per-account conditional UPDATE stays the atomic claim; grouping a round
+  // of them in one batch costs 1 subrequest. Extra rounds only happen when a
+  // concurrent invocation won some claims (meta.changes = 0).
+  while (claimed.length < maxAccounts && cursor < candidates.length) {
+    const attempts = candidates.slice(cursor, cursor + (maxAccounts - claimed.length));
+    cursor += attempts.length;
+
+    const results = await env.DB.batch(
+      attempts.map((account) =>
+        env.DB.prepare(claimSql).bind(nowIso, account.id, queuedStaleBefore, runningStaleBefore),
+      ),
+    );
+
+    results.forEach((result, index) => {
+      if (result.meta?.changes) {
+        claimed.push({ ...attempts[index], last_sync_status: "queued" });
+      }
+    });
   }
 
   return claimed;
 }
 
-async function syncAccounts(env, accounts, concurrency) {
+async function syncAccounts(env, accounts, concurrency, sharedBudget = null) {
   return await mapWithConcurrency(accounts, concurrency, (account) =>
-    syncAccount(env, account),
+    syncAccount(env, account, sharedBudget),
   );
 }
 
-function shouldAutoSyncAccount(env, account, now) {
-  const status = account.last_sync_status || "idle";
-  if (status === "queued") {
-    return minutesSince(account.updated_at, now) >= getQueuedStaleMinutes(env);
-  }
-
-  if (status === "running") {
-    return minutesSince(account.updated_at, now) >= getRunningStaleMinutes(env);
-  }
-
-  if (!account.last_sync_at) {
-    return true;
-  }
-
-  const lastSyncAge = minutesSince(account.last_sync_at, now);
-  if (status === "pending_retry" || (status === "error" && isTransientSyncError(account.last_sync_error))) {
-    return lastSyncAge >= getTransientRetryMinutes(env);
-  }
-
-  if (status === "error") {
-    return false;
-  }
-
-  return lastSyncAge >= getAutoSyncStaleMinutes(env);
-}
-
-function isFreshSyncInProgress(env, account, now) {
-  const status = account.last_sync_status || "idle";
-  if (status === "queued") {
-    return minutesSince(account.updated_at, now) < getQueuedStaleMinutes(env);
-  }
-  if (status === "running") {
-    return minutesSince(account.updated_at, now) < getRunningStaleMinutes(env);
-  }
-  return false;
-}
-
-async function syncAccount(env, account) {
+async function syncAccount(env, account, sharedBudget = null) {
   const startedAt = new Date().toISOString();
   const folderList = getSyncFolders(env);
   const syncRun = await env.DB.prepare(
@@ -936,6 +1065,8 @@ async function syncAccount(env, account) {
 
   let messageCount = 0;
   let attachmentCount = 0;
+  let partial = false;
+  const budget = sharedBudget || { remaining: getSyncOpsBudget(env) };
   const cursorMap = parseJsonObject(account.delta_links_json);
   let graphSyncError = null;
 
@@ -946,6 +1077,7 @@ async function syncAccount(env, account) {
     );
     let syncMode = "graph";
     try {
+      budget.remaining -= 1;
       const accessToken = await refreshAccessToken(
         env,
         account.client_id,
@@ -954,10 +1086,18 @@ async function syncAccount(env, account) {
       );
 
       for (const folder of folderList) {
-        const syncResult = await syncFolderMessages(env, account, accessToken, folder, cursorMap);
+        if (budget.remaining <= 0) {
+          partial = true;
+          break;
+        }
+        const syncResult = await syncFolderMessages(env, account, accessToken, folder, cursorMap, budget);
         cursorMap[folder] = syncResult.cursor;
         messageCount += syncResult.messageCount;
         attachmentCount += syncResult.attachmentCount;
+        if (syncResult.partial) {
+          partial = true;
+          break;
+        }
       }
     } catch (graphError) {
       graphSyncError = summarizeUpstreamError(graphError);
@@ -977,33 +1117,52 @@ async function syncAccount(env, account) {
         error: graphSyncError,
       });
 
+      budget.remaining -= 1;
       const accessToken = await refreshImapAccessToken(env, account.client_id, refreshToken);
       for (const folder of folderList) {
-        const syncResult = await syncImapFolderMessages(env, account, accessToken, folder, cursorMap);
+        if (budget.remaining <= 0) {
+          partial = true;
+          break;
+        }
+        const syncResult = await syncImapFolderMessages(env, account, accessToken, folder, cursorMap, budget);
         cursorMap["imap:" + folder + ":lastUid"] = syncResult.lastUid || cursorMap["imap:" + folder + ":lastUid"] || 0;
         messageCount += syncResult.messageCount;
+        if (syncResult.partial) {
+          partial = true;
+          break;
+        }
       }
     }
 
     const finishedAt = new Date().toISOString();
     await env.DB.prepare(
       `UPDATE sync_runs
-       SET status = 'success', finished_at = ?, message_count = ?, attachment_count = ?
+       SET status = 'success', finished_at = ?, message_count = ?, attachment_count = ?, error_text = ?
        WHERE id = ?`,
     )
-      .bind(finishedAt, messageCount, attachmentCount, syncRun.meta.last_row_id)
+      .bind(
+        finishedAt,
+        messageCount,
+        attachmentCount,
+        partial ? "Partial run: per-run sync budget reached; continues automatically." : null,
+        syncRun.meta.last_row_id,
+      )
       .run();
 
+    const accountStatus = partial ? "pending_retry" : "success";
+    const accountError = partial
+      ? "Sync paused: per-run sync budget reached; remaining mail continues on the next run."
+      : null;
     await env.DB.prepare(
       `UPDATE mail_accounts
-       SET last_sync_at = ?, last_sync_status = 'success', last_sync_error = NULL,
+       SET last_sync_at = ?, last_sync_status = ?, last_sync_error = ?,
            delta_links_json = ?, updated_at = ?
        WHERE id = ?`,
     )
-      .bind(finishedAt, JSON.stringify(cursorMap), finishedAt, account.id)
+      .bind(finishedAt, accountStatus, accountError, JSON.stringify(cursorMap), finishedAt, account.id)
       .run();
 
-    logInfo("sync_success", {
+    logInfo(partial ? "sync_partial" : "sync_success", {
       accountId: account.id,
       email: account.email,
       syncMode,
@@ -1014,7 +1173,7 @@ async function syncAccount(env, account) {
     return {
       accountId: account.id,
       email: account.email,
-      status: "success",
+      status: partial ? "partial" : "success",
       syncMode,
       messageCount,
       attachmentCount,
@@ -1059,14 +1218,21 @@ async function syncAccount(env, account) {
   }
 }
 
-async function syncFolderMessages(env, account, accessToken, folder, cursorMap) {
+async function syncFolderMessages(env, account, accessToken, folder, cursorMap, budget) {
   let url = cursorMap[folder] || buildDeltaUrl(env, folder);
   let pages = 0;
   let messageCount = 0;
   let attachmentCount = 0;
   let cursor = url;
+  let partial = false;
 
   while (url && pages < getMaxSyncPages(env)) {
+    if (budget.remaining <= 0) {
+      partial = true;
+      break;
+    }
+
+    budget.remaining -= 1;
     let payload;
     try {
       payload = await graphFetchJson(url, accessToken, { pageSize: getSyncPageSize(env) });
@@ -1075,34 +1241,65 @@ async function syncFolderMessages(env, account, accessToken, folder, cursorMap) 
       await checkpointAccountCursors(env, account.id, cursorMap);
       throw error;
     }
-    const items = Array.isArray(payload.value) ? payload.value : [];
+    const items = (Array.isArray(payload.value) ? payload.value : []).filter(
+      (item) => !item["@removed"],
+    );
 
-    for (const item of items) {
-      if (item["@removed"]) {
-        continue;
+    if (items.length) {
+      if (budget.remaining <= 0) {
+        partial = true;
+        break;
       }
 
-      const localMessageId = await upsertMessage(env, account.id, folder, item);
-      messageCount += 1;
+      const localMessageIds = await upsertMessagesBatch(env, account.id, folder, items, budget);
+      messageCount += items.length;
 
-      if (item.hasAttachments) {
+      const noAttachmentIds = [];
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index];
+        if (!item.hasAttachments) {
+          noAttachmentIds.push(localMessageIds[index]);
+          continue;
+        }
+        if (budget.remaining <= 0) {
+          partial = true;
+          break;
+        }
         attachmentCount += await syncMessageAttachments(
           env,
           accessToken,
           account.id,
-          localMessageId,
+          localMessageIds[index],
           item.id,
+          budget,
         );
-      } else {
-        await purgeMessageAttachments(env, localMessageId);
+      }
+
+      // Skipping the purge on partial is safe: the cursor stays on this page,
+      // so the next run re-fetches it and purges then.
+      if (!partial && noAttachmentIds.length) {
+        if (budget.remaining <= 0) {
+          partial = true;
+        } else {
+          await purgeAttachmentsForMessages(env, noAttachmentIds, budget);
+        }
       }
     }
 
     pages += 1;
 
+    if (partial) {
+      // Cursor stays on the current page URL so the next run re-fetches and
+      // finishes this page; message upserts are idempotent.
+      break;
+    }
+
     if (payload["@odata.nextLink"]) {
       url = payload["@odata.nextLink"];
       cursor = url;
+      cursorMap[folder] = cursor;
+      budget.remaining -= 1;
+      await checkpointAccountCursors(env, account.id, cursorMap);
       continue;
     }
 
@@ -1112,7 +1309,7 @@ async function syncFolderMessages(env, account, accessToken, folder, cursorMap) 
     break;
   }
 
-  return { cursor, messageCount, attachmentCount };
+  return { cursor, messageCount, attachmentCount, partial };
 }
 
 async function checkpointAccountCursors(env, accountId, cursorMap) {
@@ -1125,69 +1322,49 @@ async function checkpointAccountCursors(env, accountId, cursorMap) {
     .run();
 }
 
-async function upsertMessage(env, accountId, folder, item) {
-  const receivedAt = item.receivedDateTime || new Date().toISOString();
-  const bodyHtml = item.body?.content || "";
-  const bodyContentType = item.body?.contentType || null;
-  const syncedAt = new Date().toISOString();
-  const expiresAt = addDays(new Date(receivedAt), getRetentionDays(env)).toISOString();
-  const fromAddress = item.from?.emailAddress?.address || "";
-  const fromName = item.from?.emailAddress?.name || "";
-
-  const saved = await env.DB.prepare(
-    `INSERT INTO messages (
-      account_id, graph_message_id, internet_message_id, folder, subject, from_name, from_address,
-      received_at, is_read, has_attachments, body_content_type, body_html, body_text,
-      web_link, synced_at, expires_at, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(graph_message_id) DO UPDATE SET
-      account_id = excluded.account_id,
-      internet_message_id = excluded.internet_message_id,
-      folder = excluded.folder,
-      subject = excluded.subject,
-      from_name = excluded.from_name,
-      from_address = excluded.from_address,
-      received_at = excluded.received_at,
-      is_read = excluded.is_read,
-      has_attachments = excluded.has_attachments,
-      body_content_type = excluded.body_content_type,
-      body_html = excluded.body_html,
-      body_text = excluded.body_text,
-      web_link = excluded.web_link,
-      synced_at = excluded.synced_at,
-      expires_at = excluded.expires_at,
-      updated_at = excluded.updated_at
-    RETURNING id`,
-  )
-    .bind(
-      accountId,
-      item.id,
-      item.internetMessageId || null,
-      folder,
-      item.subject || "",
-      fromName,
-      fromAddress,
-      receivedAt,
-      item.isRead ? 1 : 0,
-      item.hasAttachments ? 1 : 0,
-      bodyContentType,
-      bodyHtml,
-      htmlToText(bodyHtml),
-      item.webLink || null,
-      syncedAt,
-      expiresAt,
-      syncedAt,
-    )
-    .first();
-
-  if (!saved?.id) {
-    throw new Error("Message upsert did not return an id.");
+// Upserts a whole page of messages in one env.DB.batch (1 subrequest, atomic),
+// returning the local message ids in input order via per-statement RETURNING id.
+async function upsertMessagesBatch(env, accountId, folder, items, budget) {
+  if (!items.length) {
+    return [];
   }
-  return saved.id;
+
+  const options = { now: new Date(), retentionDays: getRetentionDays(env) };
+  const paramsList = items.map((item) =>
+    buildMessageUpsertParams(accountId, folder, item, options),
+  );
+
+  const runBatch = async (mode) => {
+    const statement = env.DB.prepare(messageUpsertSqlForMode(mode));
+    return await env.DB.batch(paramsList.map((params) => statement.bind(...params)));
+  };
+
+  budget.remaining -= 1;
+  let results;
+  try {
+    results = await runBatch(await getMessageKeyMode(env));
+  } catch (error) {
+    if (/ON CONFLICT clause does not match/i.test(String(error?.message || error))) {
+      // The failed batch rolled back as a whole; rebuild every statement under
+      // the re-detected key mode and retry once.
+      invalidateMessageKeyMode();
+      budget.remaining -= 1;
+      results = await runBatch(await getMessageKeyMode(env));
+    } else {
+      throw error;
+    }
+  }
+
+  return extractBatchReturnedIds(results).map((id) => {
+    if (!id) {
+      throw new Error("Message upsert did not return an id.");
+    }
+    return id;
+  });
 }
 
-async function syncMessageAttachments(env, accessToken, accountId, localMessageId, graphMessageId) {
+async function syncMessageAttachments(env, accessToken, accountId, localMessageId, graphMessageId, budget) {
+  budget.remaining -= 1;
   const payload = await graphFetchJson(
     "https://graph.microsoft.com/v1.0/me/messages/" +
       encodeURIComponent(graphMessageId) +
@@ -1196,6 +1373,7 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
   );
 
   const attachments = Array.isArray(payload.value) ? payload.value : [];
+  budget.remaining -= 1;
   const existingRows = await env.DB.prepare(
     `SELECT id, graph_attachment_id, name, content_type, kind, size, storage_status, r2_key
      FROM attachments
@@ -1226,12 +1404,14 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
     }
 
     if (existing?.r2_key && existing.r2_key !== expectedR2Key) {
+      budget.remaining -= 1;
       await env.ATTACHMENTS.delete(existing.r2_key);
     }
 
     let r2Key = null;
     let storageStatus = "metadata_only";
     if (kind === "#microsoft.graph.fileAttachment") {
+      budget.remaining -= 2;
       const binary = await graphFetchArrayBuffer(
         "https://graph.microsoft.com/v1.0/me/messages/" +
           encodeURIComponent(graphMessageId) +
@@ -1252,6 +1432,7 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
       stored += 1;
     }
 
+    budget.remaining -= 1;
     await env.DB.prepare(
       `INSERT INTO attachments (
         message_id, graph_attachment_id, name, content_type, kind, size, storage_status, r2_key
@@ -1282,8 +1463,10 @@ async function syncMessageAttachments(env, accessToken, accountId, localMessageI
       continue;
     }
     if (row.r2_key) {
+      budget.remaining -= 1;
       await env.ATTACHMENTS.delete(row.r2_key);
     }
+    budget.remaining -= 1;
     await env.DB.prepare("DELETE FROM attachments WHERE id = ?").bind(row.id).run();
   }
 
@@ -1320,21 +1503,35 @@ function attachmentMetadataMatches(existing, item, kind, expectedR2Key) {
   );
 }
 
-async function purgeMessageAttachments(env, messageId) {
-  const existing = await env.DB.prepare(
-    "SELECT r2_key FROM attachments WHERE message_id = ? AND r2_key IS NOT NULL",
-  )
-    .bind(messageId)
-    .all();
+// Replaces the per-message attachment purge during sync: one SELECT, concurrent
+// R2 deletes, one DELETE for the whole page. Deducts the actual subrequest count.
+// Ids are chunked to stay under the D1 limit of 100 bound parameters; a normal
+// sync page fits in a single chunk.
+async function purgeAttachmentsForMessages(env, messageIds, budget) {
+  for (const chunk of chunkArray(messageIds, 100)) {
+    const placeholders = buildInPlaceholders(chunk.length);
+    budget.remaining -= 1;
+    const existing = await env.DB.prepare(
+      `SELECT message_id, r2_key FROM attachments
+       WHERE message_id IN (${placeholders}) AND r2_key IS NOT NULL`,
+    )
+      .bind(...chunk)
+      .all();
 
-  for (const row of existing.results ?? []) {
-    await env.ATTACHMENTS.delete(row.r2_key);
+    const keys = (existing.results ?? []).map((row) => row.r2_key);
+    if (keys.length) {
+      budget.remaining -= keys.length;
+      await mapWithConcurrency(keys, R2_DELETE_CONCURRENCY, (key) => env.ATTACHMENTS.delete(key));
+    }
+
+    budget.remaining -= 1;
+    await env.DB.prepare(`DELETE FROM attachments WHERE message_id IN (${placeholders})`)
+      .bind(...chunk)
+      .run();
   }
-
-  await env.DB.prepare("DELETE FROM attachments WHERE message_id = ?").bind(messageId).run();
 }
 
-async function purgeAccountArchive(env, accountId) {
+async function purgeAccountArchive(env, accountId, extraStatements = []) {
   const attachments = await env.DB.prepare(
     `SELECT at.r2_key
      FROM attachments at
@@ -1344,260 +1541,84 @@ async function purgeAccountArchive(env, accountId) {
     .bind(accountId)
     .all();
 
-  for (const row of attachments.results ?? []) {
-    await env.ATTACHMENTS.delete(row.r2_key);
-  }
+  await mapWithConcurrency(
+    (attachments.results ?? []).map((row) => row.r2_key),
+    R2_DELETE_CONCURRENCY,
+    (key) => env.ATTACHMENTS.delete(key),
+  );
 
-  await env.DB.prepare(
-    `DELETE FROM attachments
-     WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?)`,
-  )
-    .bind(accountId)
-    .run();
-
-  await env.DB.prepare("DELETE FROM messages WHERE account_id = ?").bind(accountId).run();
+  // One atomic batch covers the archive purge plus any caller-provided
+  // statements (e.g. account deletion), instead of one D1 call per table.
+  await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM attachments
+       WHERE message_id IN (SELECT id FROM messages WHERE account_id = ?)`,
+    ).bind(accountId),
+    env.DB.prepare("DELETE FROM messages WHERE account_id = ?").bind(accountId),
+    env.DB.prepare("DELETE FROM message_counters WHERE account_id = ?").bind(accountId),
+    ...extraStatements,
+  ]);
 }
 
 async function deleteMessageArchive(env, messageId) {
-  const message = await env.DB.prepare("SELECT id FROM messages WHERE id = ?")
-    .bind(messageId)
-    .first();
+  const [messageResult, attachmentResult] = await env.DB.batch([
+    env.DB.prepare("SELECT id FROM messages WHERE id = ?").bind(messageId),
+    env.DB.prepare(
+      "SELECT r2_key FROM attachments WHERE message_id = ? AND r2_key IS NOT NULL",
+    ).bind(messageId),
+  ]);
 
-  if (!message) {
+  if (!(messageResult.results ?? []).length) {
     throw new HttpError(404, "Message not found.");
   }
 
-  await purgeMessageAttachments(env, messageId);
-  await env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(messageId).run();
+  await mapWithConcurrency(
+    (attachmentResult.results ?? []).map((row) => row.r2_key),
+    R2_DELETE_CONCURRENCY,
+    (key) => env.ATTACHMENTS.delete(key),
+  );
+
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM attachments WHERE message_id = ?").bind(messageId),
+    env.DB.prepare("DELETE FROM messages WHERE id = ?").bind(messageId),
+  ]);
 }
 
 async function cleanupExpiredArchive(env) {
-  const expiredMessages = await env.DB.prepare(
-    "SELECT id FROM messages WHERE expires_at <= ? ORDER BY expires_at ASC, id ASC LIMIT ?",
-  )
-    .bind(new Date().toISOString(), EXPIRED_ARCHIVE_CLEANUP_LIMIT)
-    .all();
+  const nowIso = new Date().toISOString();
+  const expiredScopeSql =
+    "SELECT id FROM messages WHERE expires_at <= ? ORDER BY expires_at ASC, id ASC LIMIT ?";
+  // Both reads run in one batch (1 subrequest) against the same snapshot.
+  const [idsResult, keysResult] = await env.DB.batch([
+    env.DB.prepare(expiredScopeSql).bind(nowIso, EXPIRED_ARCHIVE_CLEANUP_LIMIT),
+    env.DB.prepare(
+      `SELECT r2_key FROM attachments
+       WHERE r2_key IS NOT NULL AND message_id IN (${expiredScopeSql})`,
+    ).bind(nowIso, EXPIRED_ARCHIVE_CLEANUP_LIMIT),
+  ]);
 
-  for (const row of expiredMessages.results ?? []) {
-    await deleteMessageArchive(env, row.id);
+  const messageIds = (idsResult.results ?? []).map((row) => row.id);
+  if (!messageIds.length) {
+    return;
   }
-}
 
-async function cleanupStaleSyncRuns(env) {
-  const staleBefore = minutesAgoIso(new Date(), getRunningStaleMinutes(env));
-  await env.DB.prepare(
-    `UPDATE sync_runs
-     SET status = 'error',
-         finished_at = ?,
-         error_text = 'Sync run marked stale after timeout.'
-     WHERE status = 'running'
-       AND started_at <= ?
-       AND finished_at IS NULL`,
-  )
-    .bind(new Date().toISOString(), staleBefore)
-    .run();
-  await cleanupStaleAccountSyncStates(env);
-}
-
-async function cleanupStaleAccountSyncStates(env) {
-  const now = new Date();
-  const nowIso = now.toISOString();
-  await env.DB.prepare(
-    `UPDATE mail_accounts
-     SET last_sync_status = 'pending_retry',
-         last_sync_error = 'Sync state marked stale after queued timeout.',
-         updated_at = ?
-     WHERE status = 'active'
-       AND last_sync_status = 'queued'
-       AND updated_at <= ?`,
-  )
-    .bind(nowIso, minutesAgoIso(now, getQueuedStaleMinutes(env)))
-    .run();
-  await env.DB.prepare(
-    `UPDATE mail_accounts
-     SET last_sync_status = 'pending_retry',
-         last_sync_error = 'Sync state marked stale after running timeout.',
-         updated_at = ?
-     WHERE status = 'active'
-       AND last_sync_status = 'running'
-       AND updated_at <= ?`,
-  )
-    .bind(nowIso, minutesAgoIso(now, getRunningStaleMinutes(env)))
-    .run();
-}
-
-async function cleanupOldSyncRuns(env) {
-  await env.DB.prepare(
-    "DELETE FROM sync_runs WHERE started_at <= ? AND status != 'running'",
-  )
-    .bind(addDays(new Date(), -getSyncRunRetentionDays(env)).toISOString())
-    .run();
-}
-
-async function verifyMicrosoftAccount(env, clientId, refreshToken) {
-  const accessToken = await refreshAccessToken(env, clientId, refreshToken);
-  const profile = await graphFetchJson(
-    "https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName",
-    accessToken,
+  await mapWithConcurrency(
+    (keysResult.results ?? []).map((row) => row.r2_key),
+    R2_DELETE_CONCURRENCY,
+    (key) => env.ATTACHMENTS.delete(key),
   );
-  return { accessToken, profile };
+
+  const placeholders = buildInPlaceholders(messageIds.length);
+  // One atomic batch; the messages delete trigger keeps message_counters in sync.
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM attachments WHERE message_id IN (${placeholders})`).bind(
+      ...messageIds,
+    ),
+    env.DB.prepare(`DELETE FROM messages WHERE id IN (${placeholders})`).bind(...messageIds),
+  ]);
 }
 
-async function refreshAccessToken(env, clientId, refreshToken, scope = null) {
-  const tenantId = env.MICROSOFT_TENANT_ID || "common";
-  const url =
-    "https://login.microsoftonline.com/" +
-    encodeURIComponent(tenantId) +
-    "/oauth2/v2.0/token";
-  const body = new URLSearchParams();
-  body.set("client_id", clientId);
-  body.set("grant_type", "refresh_token");
-  body.set("refresh_token", refreshToken);
-  if (scope) {
-    body.set("scope", scope);
-  }
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-
-  if (!response.ok) {
-    const detail = await response.text();
-    const parsed = parseJsonObject(detail);
-    const error = new Error("Microsoft token refresh failed: HTTP " + response.status + " " + redactSensitiveText(detail));
-    error.status = response.status;
-    error.code = parsed.error || "";
-    throw error;
-  }
-
-  const payload = await response.json();
-  if (!payload.access_token) {
-    throw new Error("Microsoft token refresh returned no access token.");
-  }
-
-  return payload.access_token;
-}
-
-async function refreshImapAccessToken(env, clientId, refreshToken) {
-  const attempts = [
-    "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
-    "https://outlook.office.com/.default offline_access",
-    null,
-  ];
-  const errors = [];
-
-  for (const scope of attempts) {
-    try {
-      return await refreshAccessToken(env, clientId, refreshToken, scope);
-    } catch (error) {
-      errors.push(scope ? scope + ": " + summarizeUpstreamError(error) : "original scope: " + summarizeUpstreamError(error));
-    }
-  }
-
-  throw new Error("Unable to refresh IMAP access token. " + errors.join(" | "));
-}
-
-function buildDeltaUrl(env, folder) {
-  const cutoff = addDays(new Date(), -getRetentionDays(env)).toISOString();
-  const params = new URLSearchParams();
-  params.set(
-    "$select",
-    "id,internetMessageId,subject,from,receivedDateTime,body,isRead,hasAttachments,webLink",
-  );
-  params.set("$top", String(getSyncPageSize(env)));
-  params.set("$filter", "receivedDateTime ge " + cutoff);
-
-  return (
-    "https://graph.microsoft.com/v1.0/me/mailFolders/" +
-    encodeURIComponent(folder) +
-    "/messages/delta?" +
-    params.toString()
-  );
-}
-
-async function graphFetchJson(url, accessToken, options = {}) {
-  const headers = {
-    authorization: "Bearer " + accessToken,
-  };
-  if (options.pageSize) {
-    headers.prefer = "odata.maxpagesize=" + String(options.pageSize);
-  }
-  const response = await graphFetchWithRetry(url, {
-    headers,
-    errorPrefix: "Microsoft Graph request failed",
-  });
-
-  return await response.json();
-}
-
-async function graphFetchArrayBuffer(url, accessToken) {
-  const response = await graphFetchWithRetry(url, {
-    headers: {
-      authorization: "Bearer " + accessToken,
-    },
-    errorPrefix: "Microsoft Graph binary request failed",
-  });
-
-  return await response.arrayBuffer();
-}
-
-async function graphFetchWithRetry(url, options) {
-  const attempts = 3;
-  let lastError;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      const response = await fetch(url, { headers: options.headers });
-      if (!response.ok) {
-        throw await createGraphHttpError(response, options.errorPrefix);
-      }
-      return response;
-    } catch (error) {
-      lastError = error;
-      if (attempt >= attempts - 1 || !isRetryableGraphError(error)) {
-        throw error;
-      }
-      const retryDelayMs = Math.min(8000, Math.max(error.retryAfterMs || 0, 500 * 2 ** attempt + Math.floor(Math.random() * 250)));
-      await delay(retryDelayMs);
-    }
-  }
-  throw lastError;
-}
-
-async function createGraphHttpError(response, prefix) {
-  const detail = await response.text();
-  const parsed = parseJsonObject(detail);
-  const code = parsed.error?.code || parsed.code || "";
-  const error = new Error(prefix + " (" + response.status + "): " + redactSensitiveText(detail));
-  error.status = response.status;
-  error.code = code;
-  error.retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-  return error;
-}
-
-function isRetryableGraphError(error) {
-  const status = Number(error?.status || 0);
-  if (status === 429 || status === 503 || status === 504 || status >= 500) return true;
-  const code = String(error?.code || "").toLowerCase();
-  if (["toomanyrequests", "ratelimitexceeded", "serviceunavailable", "internalservererror", "timeout"].includes(code)) return true;
-  const message = String(error?.message || error || "").toLowerCase();
-  return message.includes("network") || message.includes("timeout") || message.includes("timed out");
-}
-
-function parseRetryAfterMs(value) {
-  if (!value) return 0;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const dateMs = Date.parse(value);
-  return Number.isNaN(dateMs) ? 0 : Math.max(0, dateMs - Date.now());
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function syncImapFolderMessages(env, account, accessToken, folder, cursorMap = {}) {
+async function syncImapFolderMessages(env, account, accessToken, folder, cursorMap = {}, budget = { remaining: Number.POSITIVE_INFINITY }) {
   const bodyPeekBytes = getImapBodyPeekBytes(env);
   const fetchBatchSize = getImapFetchBatchSize(env);
   const client = await createImapClient("outlook.office365.com", 993, {
@@ -1631,12 +1652,17 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
     const uids = previousLastUid > 0 ? searchedUids : searchedUids.slice(-getSyncPageSize(env));
     let messageCount = 0;
     let lastUid = previousLastUid;
+    let partial = false;
 
     if (!uids.length) {
-      return { messageCount: 0, mailbox, lastUid };
+      return { messageCount: 0, mailbox, lastUid, partial };
     }
 
     for (const chunk of chunkArray(uids, fetchBatchSize)) {
+      if (budget.remaining <= 0) {
+        partial = true;
+        break;
+      }
       const response = await client.command(
         "UID FETCH " + chunk.join(",") + " (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[]<0." + bodyPeekBytes + ">)",
         "OK",
@@ -1646,384 +1672,23 @@ async function syncImapFolderMessages(env, account, accessToken, folder, cursorM
         },
       );
       const rawMessages = extractImapLiteralBodies(response);
-      for (const rawMessage of rawMessages) {
-        const item = parseRawEmailToGraphLikeItem(rawMessage, account.email, folder);
-        await upsertMessage(env, account.id, folder, item);
-        messageCount += 1;
+      const chunkItems = rawMessages.map((rawMessage) =>
+        parseRawEmailToGraphLikeItem(rawMessage, account.email, folder),
+      );
+      if (chunkItems.length) {
+        await upsertMessagesBatch(env, account.id, folder, chunkItems, budget);
+        messageCount += chunkItems.length;
       }
       lastUid = Math.max(lastUid, ...chunk);
       cursorMap[cursorKey] = lastUid;
+      budget.remaining -= 1;
       await checkpointAccountCursors(env, account.id, cursorMap);
     }
 
-    return { messageCount, mailbox, lastUid };
+    return { messageCount, mailbox, lastUid, partial };
   } finally {
     await client.close();
   }
-}
-
-async function createImapClient(hostname, port, readDefaults = {}) {
-  const socket = connect(
-    { hostname, port },
-    { secureTransport: "on" },
-  );
-  const reader = socket.readable.getReader();
-  const writer = socket.writable.getWriter();
-  const decoder = new TextDecoder();
-  const textEncoder = new TextEncoder();
-  let tagIndex = 1;
-
-  async function readUntil(pattern, options = {}) {
-    const label = options.label || "IMAP command";
-    const totalTimeoutMs = options.totalTimeoutMs || readDefaults.totalTimeoutMs || DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS * 1000;
-    const idleTimeoutMs = options.idleTimeoutMs || readDefaults.idleTimeoutMs || DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS * 1000;
-    const maxBytes = options.maxBytes || DEFAULT_IMAP_BASE_RESPONSE_BYTES;
-    const startedAt = Date.now();
-    let bytesRead = 0;
-    let chunksRead = 0;
-    let text = "";
-    while (Date.now() - startedAt < totalTimeoutMs) {
-      const remainingMs = totalTimeoutMs - (Date.now() - startedAt);
-      const { value, done } = await readChunkWithTimeout(
-        reader,
-        Math.max(1, Math.min(idleTimeoutMs, remainingMs)),
-        label,
-      );
-      if (done) {
-        break;
-      }
-      chunksRead += 1;
-      bytesRead += value.byteLength || value.length || 0;
-      if (bytesRead > maxBytes) {
-        throw new Error(
-          "IMAP response exceeded " +
-            maxBytes +
-            " bytes while reading " +
-            label +
-            ".",
-        );
-      }
-      text += decoder.decode(value, { stream: true });
-      if (pattern.test(text)) {
-        return text;
-      }
-    }
-    throw new Error(
-      "IMAP response did not complete for " +
-        label +
-        " after " +
-        (Date.now() - startedAt) +
-        "ms (" +
-        chunksRead +
-        " chunks, " +
-        bytesRead +
-        " bytes).",
-    );
-  }
-
-  async function writeLine(line) {
-    await writer.write(textEncoder.encode(line + "\r\n"));
-  }
-
-  return {
-    async readGreeting() {
-      return await readUntil(/\* OK/i, { label: "IMAP greeting" });
-    },
-    async command(commandText, expected = "OK", options = {}) {
-      const tag = "A" + String(tagIndex++).padStart(4, "0");
-      const label = options.label || summarizeImapCommand(commandText);
-      await writeLine(tag + " " + commandText);
-      const response = await readUntil(
-        new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"),
-        { ...options, label },
-      );
-      const statusMatch = response.match(new RegExp("\\r?\\n" + tag + " (OK|NO|BAD)", "i"));
-      const status = statusMatch ? statusMatch[1].toUpperCase() : "";
-      if (expected && status !== expected) {
-        throw new Error("IMAP command failed: " + summarizeImapResponse(response));
-      }
-      return response;
-    },
-    async close() {
-      try {
-        await writeLine("A9999 LOGOUT");
-      } catch {
-        // Ignore close failures.
-      }
-      try {
-        writer.releaseLock();
-        reader.releaseLock();
-      } catch {
-        // Ignore lock release failures.
-      }
-      try {
-        await socket.close();
-      } catch {
-        // Ignore socket close failures.
-      }
-    },
-  };
-}
-
-async function readChunkWithTimeout(reader, timeoutMs, label) {
-  let timeoutId;
-  try {
-    return await Promise.race([
-      reader.read(),
-      new Promise((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(new Error("IMAP read timed out for " + label + " after " + timeoutMs + "ms.")),
-          timeoutMs,
-        );
-      }),
-    ]);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function selectImapMailbox(client, folder) {
-  const candidates = folder === "junkemail"
-    ? ["Junk", "Junk Email", "Junk E-mail"]
-    : ["INBOX"];
-
-  const errors = [];
-  for (const mailbox of candidates) {
-    try {
-      await client.command('SELECT "' + mailbox.replace(/"/g, '\\"') + '"', "OK");
-      return mailbox;
-    } catch (error) {
-      errors.push(mailbox + ": " + summarizeUpstreamError(error));
-    }
-  }
-
-  throw new Error("Unable to select IMAP folder " + folder + ". " + errors.join(" | "));
-}
-
-function makeXoauth2Token(email, accessToken) {
-  return btoa("user=" + email + "\x01auth=Bearer " + accessToken + "\x01\x01");
-}
-
-function parseImapSearchUids(response) {
-  const ids = [];
-  const pattern = /\* SEARCH ([\d\s]*)/gi;
-  let match;
-  while ((match = pattern.exec(response)) !== null) {
-    const values = match[1].trim().split(/\s+/);
-    for (const value of values) {
-      const id = Number.parseInt(value, 10);
-      if (Number.isInteger(id) && id > 0) ids.push(id);
-    }
-  }
-  return ids;
-}
-
-function extractImapLiteralBodies(response) {
-  const bodies = [];
-  const literalPattern = /\{(\d+)\}\r?\n/g;
-  let match;
-  while ((match = literalPattern.exec(response))) {
-    const length = Number.parseInt(match[1], 10);
-    if (!Number.isInteger(length) || length <= 0) {
-      continue;
-    }
-    const start = match.index + match[0].length;
-    bodies.push(response.slice(start, start + length));
-    literalPattern.lastIndex = start + length;
-  }
-  return bodies;
-}
-
-function parseRawEmailToGraphLikeItem(rawMessage, accountEmail, folder) {
-  const headerEnd = rawMessage.search(/\r?\n\r?\n/);
-  const rawHeaders = headerEnd >= 0 ? rawMessage.slice(0, headerEnd) : rawMessage;
-  const rawBody = headerEnd >= 0 ? rawMessage.slice(headerEnd).trim() : "";
-  const headers = parseEmailHeaders(rawHeaders);
-  const from = parseEmailAddress(headers.from || "");
-  const date = headers.date ? new Date(headers.date) : new Date();
-  const receivedDateTime = Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
-  const subject = decodeMimeWords(headers.subject || "");
-  const body = extractEmailBody(rawHeaders, rawBody);
-  const messageId = headers["message-id"] || shaLikeId(accountEmail + ":" + folder + ":" + subject + ":" + receivedDateTime);
-
-  return {
-    id: "imap:" + messageId,
-    internetMessageId: messageId,
-    subject,
-    from: {
-      emailAddress: {
-        address: from.address,
-        name: from.name,
-      },
-    },
-    receivedDateTime,
-    body: {
-      contentType: body.contentType,
-      content: body.content,
-    },
-    isRead: true,
-    hasAttachments: false,
-    webLink: null,
-  };
-}
-
-function parseEmailHeaders(rawHeaders) {
-  const result = {};
-  const unfolded = rawHeaders.replace(/\r?\n[ \t]+/g, " ");
-  for (const line of unfolded.split(/\r?\n/)) {
-    const index = line.indexOf(":");
-    if (index === -1) {
-      continue;
-    }
-    result[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
-  }
-  return result;
-}
-
-function parseEmailAddress(value) {
-  const decoded = decodeMimeWords(value);
-  const match = decoded.match(/^(.*)<([^>]+)>$/);
-  if (match) {
-    return {
-      name: match[1].replace(/"/g, "").trim(),
-      address: match[2].trim(),
-    };
-  }
-  return {
-    name: "",
-    address: decoded.trim(),
-  };
-}
-
-function extractEmailBody(rawHeaders, rawBody) {
-  const contentType = parseContentType(rawHeaders);
-  if (contentType.boundary) {
-    const parts = rawBody.split("--" + contentType.boundary);
-    const htmlPart = parts.find((part) => /content-type:\s*text\/html/i.test(part));
-    const textPart = parts.find((part) => /content-type:\s*text\/plain/i.test(part));
-    if (htmlPart) {
-      return { contentType: "html", content: decodeEmailPart(htmlPart) };
-    }
-    if (textPart) {
-      return { contentType: "text", content: escapeTextAsHtml(decodeEmailPart(textPart)) };
-    }
-  }
-
-  if (contentType.value.includes("text/html")) {
-    return { contentType: "html", content: decodeBodyByHeaders(rawHeaders, rawBody) };
-  }
-
-  return { contentType: "text", content: escapeTextAsHtml(decodeBodyByHeaders(rawHeaders, rawBody)) };
-}
-
-function parseContentType(rawHeaders) {
-  const headers = parseEmailHeaders(rawHeaders);
-  const value = String(headers["content-type"] || "text/plain").toLowerCase();
-  const boundaryMatch = String(headers["content-type"] || "").match(/boundary="?([^";]+)"?/i);
-  return {
-    value,
-    boundary: boundaryMatch ? boundaryMatch[1] : "",
-  };
-}
-
-function decodeEmailPart(part) {
-  const splitIndex = part.search(/\r?\n\r?\n/);
-  if (splitIndex === -1) {
-    return part.trim();
-  }
-  const headers = part.slice(0, splitIndex);
-  const body = part.slice(splitIndex).trim();
-  return decodeBodyByHeaders(headers, body);
-}
-
-function decodeBodyByHeaders(rawHeaders, body) {
-  const headers = parseEmailHeaders(rawHeaders);
-  const encoding = String(headers["content-transfer-encoding"] || "").toLowerCase();
-  if (encoding.includes("base64")) {
-    try {
-      return new TextDecoder().decode(base64ToUint8(body.replace(/\s+/g, "")));
-    } catch {
-      return body;
-    }
-  }
-  if (encoding.includes("quoted-printable")) {
-    return decodeQuotedPrintable(body);
-  }
-  return body;
-}
-
-function decodeMimeWords(value) {
-  return String(value).replace(/=\?([^?]+)\?([BQ])\?([^?]+)\?=/gi, (_match, charset, encoding, text) => {
-    try {
-      const bytes = encoding.toUpperCase() === "B"
-        ? base64ToUint8(text)
-        : quotedPrintableToBytes(text.replace(/_/g, " "));
-      return new TextDecoder(charset).decode(bytes);
-    } catch {
-      return text;
-    }
-  });
-}
-
-function decodeQuotedPrintable(value) {
-  try {
-    return new TextDecoder().decode(quotedPrintableToBytes(value));
-  } catch {
-    return value;
-  }
-}
-
-function quotedPrintableToBytes(value) {
-  const normalized = String(value)
-    .replace(/=\r?\n/g, "")
-    .replace(/=([0-9A-F]{2})/gi, (_match, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
-  return Uint8Array.from(normalized, (char) => char.charCodeAt(0));
-}
-
-function escapeTextAsHtml(value) {
-  return "<pre style=\"white-space:pre-wrap;font-family:inherit\">" + escapeHtml(value) + "</pre>";
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
-}
-
-function formatImapSearchDate(date) {
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  return date.getUTCDate() + "-" + months[date.getUTCMonth()] + "-" + date.getUTCFullYear();
-}
-
-function shaLikeId(value) {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
-  }
-  return "generated-" + hash.toString(16);
-}
-
-function summarizeImapCommand(commandText) {
-  const text = String(commandText || "");
-  if (/^AUTHENTICATE\s+XOAUTH2/i.test(text)) {
-    return "AUTHENTICATE XOAUTH2";
-  }
-  return text.replace(/\s+/g, " ").slice(0, 120);
-}
-
-function summarizeImapResponse(response) {
-  return response.replace(/\s+/g, " ").slice(-600);
 }
 
 async function getSession(request, env) {
@@ -2112,208 +1777,6 @@ async function getAccountByEmail(env, email) {
     .first();
 }
 
-function getRetentionDays(env) {
-  return clampInt(env.MAIL_RETENTION_DAYS, DEFAULT_RETENTION_DAYS, 1, 3650);
-}
-
-function getSessionTtlHours(env) {
-  return clampInt(env.SESSION_TTL_HOURS, DEFAULT_SESSION_TTL_HOURS, 1, 24 * 30);
-}
-
-function getSyncPageSize(env) {
-  return clampInt(env.SYNC_PAGE_SIZE, DEFAULT_SYNC_PAGE_SIZE, 1, 100);
-}
-
-function getMaxSyncPages(env) {
-  return clampInt(env.MAX_SYNC_PAGES, DEFAULT_MAX_SYNC_PAGES, 1, 500);
-}
-
-function getSyncConcurrency(env) {
-  return clampInt(env.SYNC_CONCURRENCY, 3, 1, 10);
-}
-
-function getAutoSyncStaleMinutes(env) {
-  return clampInt(env.AUTO_SYNC_STALE_MINUTES, DEFAULT_AUTO_SYNC_STALE_MINUTES, 5, 24 * 60);
-}
-
-function getTransientRetryMinutes(env) {
-  return clampInt(env.TRANSIENT_RETRY_MINUTES, DEFAULT_TRANSIENT_RETRY_MINUTES, 5, 24 * 60);
-}
-
-function getQueuedStaleMinutes(env) {
-  return clampInt(env.QUEUED_STALE_MINUTES, DEFAULT_QUEUED_STALE_MINUTES, 5, 24 * 60);
-}
-
-function getRunningStaleMinutes(env) {
-  return clampInt(env.RUNNING_STALE_MINUTES, DEFAULT_RUNNING_STALE_MINUTES, 15, 24 * 60);
-}
-
-function getMaxSyncAccountsPerRun(env) {
-  return clampInt(env.MAX_SYNC_ACCOUNTS_PER_RUN, DEFAULT_MAX_SYNC_ACCOUNTS_PER_RUN, 1, 25);
-}
-
-function getSyncRunRetentionDays(env) {
-  return clampInt(env.SYNC_RUN_RETENTION_DAYS, DEFAULT_SYNC_RUN_RETENTION_DAYS, 1, 365);
-}
-
-function getImapFetchBatchSize(env) {
-  return clampInt(env.IMAP_FETCH_BATCH_SIZE, DEFAULT_IMAP_FETCH_BATCH_SIZE, 1, 10);
-}
-
-function getImapBodyPeekBytes(env) {
-  return clampInt(env.IMAP_BODY_PEEK_BYTES, DEFAULT_IMAP_BODY_PEEK_BYTES, 64 * 1024, 8 * 1024 * 1024);
-}
-
-function getImapCommandTimeoutSeconds(env) {
-  return clampInt(env.IMAP_COMMAND_TIMEOUT_SECONDS, DEFAULT_IMAP_COMMAND_TIMEOUT_SECONDS, 10, 120);
-}
-
-function getImapIdleTimeoutSeconds(env) {
-  return clampInt(env.IMAP_IDLE_TIMEOUT_SECONDS, DEFAULT_IMAP_IDLE_TIMEOUT_SECONDS, 3, 60);
-}
-
-function getImapFetchMaxResponseBytes(bodyPeekBytes, batchSize) {
-  return DEFAULT_IMAP_BASE_RESPONSE_BYTES + bodyPeekBytes * Math.max(1, batchSize);
-}
-
-function getSyncFolders(env) {
-  const raw = typeof env.SYNC_FOLDERS === "string" ? env.SYNC_FOLDERS : "";
-  const folders = raw
-    .split(",")
-    .map((item) => item.trim().toLowerCase())
-    .filter(Boolean);
-  return folders.length ? folders : DEFAULT_SYNC_FOLDERS;
-}
-
-function clampInt(value, fallback, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
-  const parsed = Number.parseInt(value, 10);
-  if (Number.isNaN(parsed)) {
-    return fallback;
-  }
-  return Math.min(max, Math.max(min, parsed));
-}
-
-function minutesSince(value, now = new Date()) {
-  const time = Date.parse(value || "");
-  if (Number.isNaN(time)) {
-    return Number.POSITIVE_INFINITY;
-  }
-  return Math.max(0, (now.getTime() - time) / 60000);
-}
-
-function minutesAgoIso(now, minutes) {
-  return new Date(now.getTime() - minutes * 60000).toISOString();
-}
-
-function isTransientSyncError(error) {
-  const status = Number(error?.status || 0);
-  if (status === 429 || status === 503 || status === 504 || status >= 500) return true;
-  const code = String(error?.code || error?.error?.code || error?.odataError?.code || "").toLowerCase();
-  if (["toomanyrequests", "ratelimitexceeded", "serviceunavailable", "internalservererror", "timeout"].includes(code)) {
-    return true;
-  }
-  const message = String(error?.message || error || "").toLowerCase();
-  return [
-    "too many",
-    "429",
-    "rate limit",
-    "throttl",
-    "temporar",
-    "try again",
-    "timeout",
-    "timed out",
-    "network",
-    "socket",
-    "connection",
-    "server busy",
-    "service unavailable",
-    "503",
-    "504",
-    "imap response did not complete",
-  ].some((pattern) => message.includes(pattern));
-}
-
-async function mapWithConcurrency(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-      results[currentIndex] = await worker(items[currentIndex], currentIndex);
-    }
-  });
-  await Promise.all(runners);
-  return results;
-}
-
-function normalizeGroupName(value) {
-  const input = typeof value === "string" ? value.trim() : "";
-  return input || "默认分组";
-}
-
-function addHours(date, hours) {
-  return new Date(date.getTime() + hours * 3600 * 1000);
-}
-
-function addDays(date, days) {
-  return new Date(date.getTime() + days * 24 * 3600 * 1000);
-}
-
-function htmlToText(html) {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&#39;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function parseJsonObject(value) {
-  try {
-    const parsed = JSON.parse(value || "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function randomHex(bytes) {
-  return [...crypto.getRandomValues(new Uint8Array(bytes))]
-    .map((value) => value.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function sha256Hex(text) {
-  const hash = await crypto.subtle.digest("SHA-256", encoder.encode(text));
-  return [...new Uint8Array(hash)]
-    .map((value) => value.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function constantTimeStringEquals(actual, expected) {
-  const [actualHash, expectedHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(actual)),
-    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
-  ]);
-  const actualBytes = new Uint8Array(actualHash);
-  const expectedBytes = new Uint8Array(expectedHash);
-  if (typeof crypto.subtle.timingSafeEqual === "function") {
-    return crypto.subtle.timingSafeEqual(actualBytes, expectedBytes);
-  }
-  let diff = actualBytes.length ^ expectedBytes.length;
-  for (let index = 0; index < actualBytes.length; index += 1) {
-    diff |= actualBytes[index] ^ expectedBytes[index];
-  }
-  return diff === 0;
-}
-
 async function getSessionHash(token, env) {
   if (!env.SESSION_SECRET) {
     throw new HttpError(500, "SESSION_SECRET is not configured.");
@@ -2325,77 +1788,7 @@ function sanitizeKeyPart(value) {
   return encodeURIComponent(String(value).replace(/\//g, "_"));
 }
 
-function maskToken(token) {
-  if (!token || token.length < 12) {
-    return "***";
-  }
-  return token.slice(0, 6) + "..." + token.slice(-4);
-}
-
-function maskEmail(email) {
-  const value = String(email || "");
-  const at = value.indexOf("@");
-  if (at <= 0) return value ? "***" : "";
-  const local = value.slice(0, at);
-  const domain = value.slice(at + 1);
-  return local.slice(0, Math.min(2, local.length)) + "***@" + domain;
-}
-
-function maskLogEmails(value, key = "") {
-  if (Array.isArray(value)) {
-    return value.map((item) => maskLogEmails(item));
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value).map(([entryKey, entryValue]) => [
-        entryKey,
-        maskLogEmails(entryValue, entryKey),
-      ]),
-    );
-  }
-  if (typeof value === "string" && key.toLowerCase().includes("email")) {
-    return maskEmail(value);
-  }
-  return value;
-}
-
-function summarizeUpstreamError(error) {
-  const message = error && error.message ? String(error.message) : String(error);
-  return redactSensitiveText(message).replace(/\s+/g, " ").trim().slice(0, 600);
-}
-
-function shouldAttemptImapFallback(error) {
-  const message = summarizeUpstreamError(error).toLowerCase();
-  if (isTransientSyncError(message)) {
-    return false;
-  }
-  if (!message.startsWith("microsoft token refresh failed:")) {
-    return true;
-  }
-  return ![
-    "invalid_grant",
-    "invalid_client",
-    "unauthorized_client",
-    "interaction_required",
-    "consent_required",
-  ].some((marker) => message.includes(marker));
-}
-
-function summarizeSyncFailure(error, graphError = null) {
-  const imapError = summarizeUpstreamError(error);
-  if (!graphError) {
-    return imapError;
-  }
-  return ("Graph failed: " + graphError + " | IMAP failed: " + imapError).slice(0, 600);
-}
-
-function logInfo(event, detail) {
-  console.log(
-    JSON.stringify({
-      level: "info",
-      event,
-      ...maskLogEmails(redactSensitiveValue(detail)),
-      at: new Date().toISOString(),
-    }),
-  );
+function normalizeGroupName(value) {
+  const input = typeof value === "string" ? value.trim() : "";
+  return input || "默认分组";
 }
